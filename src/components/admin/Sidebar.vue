@@ -6,21 +6,14 @@ const authStore = useAuthStore();
 
 const navLinks = [
   { name: 'Subir Depósitos', route: 'admin-upload-deposits', permission: 'canUploadDeposits', icon: 'M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12' },
-  { name: 'Subir Ventas Shopify', route: 'admin-upload-shopify', permission: 'canUploadDeposits', icon: 'M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 00-2-2V9z' },
+  { name: 'Subir Ventas Shopify', route: 'admin-upload-shopify', permission: 'canUploadDeposits', icon: 'M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z' },
   { name: 'Ver Depósitos', route: 'admin-view-deposits', permissions: ['canViewAllDeposits', 'canViewScopedDeposits'], icon: 'M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z' },
 
   { name: 'Pendientes de revisar', route: 'admin-reconciliation', permission: 'canUploadDeposits', icon: 'M3 10h18M7 14h10m-8 4h6m-7-8h8' },
 
-  // Reportes
-  { name: 'Reportes', route: 'admin-reports', permission: 'canViewReports', icon: 'M11 3a8 8 0 100 16 8 8 0 000-16m1 4v4l3 3' },
-
-  // ✅ Reporte diario (ajustado a tus roles reales)
-  {
-    name: 'Reporte diario',
-    route: 'restaurant-daily-report',
-    permission: 'canSubmitStoreReports',
-    icon: 'M5 13l4 4L19 7M9 7h10M9 11h10M9 15h6',
-  },
+  /* Reportes */
+  { name: 'Reportes',              route: 'admin-reports',        permission: 'canViewReports',         icon: 'M11 3a8 8 0 100 16 8 8 0 000-16m1 4v4l3 3' },
+  { name: 'Reportes diarios (tienda)', route: 'admin-daily-reports', permission: 'canReviewDailyReports', icon: 'M9 17v-6h6v6M8 21h8a2 2 0 002-2v-7a2 2 0 00-.586-1.414l-4-4A2 2 0 0012 6H8a2 2 0 00-2 2v11a2 2 0 002 2z' },
 
   { name: 'Gestionar Usuarios', route: 'admin-manage-users', permission: 'canManageUsers', icon: 'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M15 21a6 6 0 00-9-5.197m0 0A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-3-5.197M15 21a6 6 0 00-9-5.197' },
   { name: 'Gestionar Roles', route: 'admin-manage-roles', permission: 'canManageRoles', icon: 'M10 20l4-16m4 4l-4 16M6 9l-4 4m0 0l4 4m-4-4h16' },
@@ -32,7 +25,6 @@ const navLinks = [
 ];
 
 const isSuper = () => (authStore.user?.roleId?.id || '').toLowerCase().includes('super');
-const roleIdLower = () => (authStore.user?.roleId?.id || '').toLowerCase();
 
 const hasPermission = (link) => {
   const userPermissions = authStore.user?.permissions || {};
@@ -41,24 +33,12 @@ const hasPermission = (link) => {
   let allowed = false;
   if (link.permission) allowed = !!userPermissions[link.permission];
   else if (link.permissions) allowed = link.permissions.some(p => !!userPermissions[p]);
+  else allowed = false;
 
+  // fallback útil para ver Reportes si tiene visibilidad de depósitos
   if (!allowed && link.route === 'admin-reports') {
     allowed = !!userPermissions.canViewAllDeposits || !!userPermissions.canUploadDeposits;
   }
-
-  // ✅ Mostrar “Reporte diario” si el rol es admin, admindetienda, operadortienda, superadmin
-  if (!allowed && link.route === 'restaurant-daily-report') {
-    const rid = roleIdLower();
-    if (
-      rid.includes('admin') ||
-      rid.includes('admindetienda') ||
-      rid.includes('operadortienda') ||
-      rid.includes('superadmin')
-    ) {
-      allowed = true;
-    }
-  }
-
   return allowed;
 };
 </script>
