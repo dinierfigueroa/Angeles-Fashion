@@ -1,5 +1,8 @@
 {
   "projects": {
-    "default": "angelesfashion-3dba9437af"
-  }
+    "default": "angelesfashion-3dba9437af",
+    "angelesFashion": "angelesfashion-3dba9437af"
+  },
+  "targets": {},
+  "etags": {}
 }

@@ -1,340 +1,445 @@
 // src/services/reconcileService.js
 import { db } from '@/firebase';
 import {
-  collection, query, where, orderBy, getDocs, doc, writeBatch,
-  serverTimestamp, Timestamp, getDoc, limit
+  collection, query, where, orderBy, getDocs, doc, runTransaction,
+  arrayUnion, arrayRemove, Timestamp
 } from 'firebase/firestore';
 
-/** --- Normalizaciones y utilidades --- **/
-const strip = (s) =>
-  String(s || '')
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .replace(/[^a-z0-9 ]/gi, ' ')
+/* =========================
+ * Estados / utilidades
+ * ========================= */
+export const ES = {
+  DISPONIBLE: 'disponible',
+  RESERVADO: 'reservado',
+  PARCIAL: 'parcial',
+  LIQUIDADO: 'liquidado',
+  AUTO_LIQ: 'auto_liquidado',
+  DEVUELTO: 'devuelto',
+  PENDIENTE: 'pendiente',
+  PENDING_REVIEW: 'pending_review',
+  UNMATCHED: 'unmatched',
+};
+
+const FINAL_STATES = [ES.LIQUIDADO, ES.AUTO_LIQ, ES.DEVUELTO];
+const isFinal = (s) => FINAL_STATES.includes(String(s || '').toLowerCase());
+
+export const normalizeBankKey = (raw = '') => {
+  const s = String(raw || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\./g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .toUpperCase();
 
-const GATEWAY_TO_BANK = (g) => {
-  const s = strip(g);
-  if (s.includes('BAC')) return 'BAC Credomatic';
-  if (s.includes('ATLANT')) return 'ATLANTIDA';
+  if (s.includes('CREDOMATIC') || s === 'BAC') return 'BAC';
   if (s.includes('FICO')) return 'FICOHSA';
-  if (s.includes('OCCID')) return 'OCCIDENTE';
-  if (s.includes('BANPAIS')) return 'BANPAIS';
-  if (s.includes('BANRURAL')) return 'BANRURAL';
-  return s || g || '';
+  if (s.includes('ATLANT')) return 'ATLANTIDA';
+  if (s.includes('PAIS')) return 'BANPAIS';
+  if (s.includes('OCCIDENT')) return 'OCCIDENTE';
+  if (s.includes('RURAL')) return 'BANRURAL';
+  return s || 'DESCONOCIDO';
 };
 
-const withinDays = (date, base, days = 1) => {
-  const d = date instanceof Date ? date : date?.toDate?.() ?? new Date(date);
-  const b = base instanceof Date ? base : base?.toDate?.() ?? new Date(base);
-  if (!(d instanceof Date) || isNaN(d)) return false;
-  if (!(b instanceof Date) || isNaN(b)) return false;
-  const diff = Math.abs(
-    d.setHours(0, 0, 0, 0) - b.setHours(0, 0, 0, 0)
-  );
-  return diff <= days * 86400000;
-};
+const toDate   = (v) => (v?.toDate ? v.toDate() : new Date(v));
+const dayStart = (d) => { const x = new Date(d); x.setHours(0,0,0,0); return x; };
+const dayEnd   = (d) => { const x = new Date(d); x.setHours(23,59,59,999); return x; };
+const round2   = (n) => Number((Number(n || 0)).toFixed(2));
+const remaining = (total, matched) => round2(Number(total||0) - Number(matched||0));
 
-const rem = (total, matchedTotal) =>
-  Number((Number(total || 0) - Number(matchedTotal || 0)).toFixed(2));
+/* =========================
+ * Candidatos
+ * ========================= */
+export async function fetchSaleCandidatesForDeposit(dep, { dayWindow = 1, tolerance = 0 } = {}) {
+  const depDate = toDate(dep.transactionDate);
+  const bankKey = dep.bankKey || normalizeBankKey(dep.bank);
+  if (!depDate || isNaN(depDate)) return [];
 
-/** combinaciones 1 ó 2 elementos (rápido) que sumen target */
-function combosUpTo2(items, target, tolerance = 0) {
-  const t = Number(target);
-  const tol = Number(tolerance);
-  const out = [];
+  const from = dayStart(new Date(depDate.getTime() - dayWindow * 86400000));
+  const to   = dayEnd(  new Date(depDate.getTime() + dayWindow * 86400000));
 
-  // 1:1
-  for (const it of items) {
-    const v = Number(it.remainingAmount);
-    if (Math.abs(v - t) <= tol) out.push([it]);
-  }
-  if (out.length) return out;
-
-  // 2:1
-  for (let i = 0; i < items.length; i++) {
-    for (let j = i + 1; j < items.length; j++) {
-      const v = Number(items[i].remainingAmount) + Number(items[j].remainingAmount);
-      if (Math.abs(v - t) <= tol) out.push([items[i], items[j]]);
-    }
-  }
-  return out;
-}
-
-function scoreDepositForSale(dep, sale, dayWindow) {
-  // higher is better
-  const sVendor =
-    sale.vendorRef?.id && dep.vendorId?.id && sale.vendorRef.id === dep.vendorId.id ? 5 : 0;
-  const sStore =
-    sale.storeId?.id && dep.storeId?.id && sale.storeId.id === dep.storeId.id ? 3 : 0;
-  const sReserved = dep.status === 'reservado' ? 2 : 0;
-
-  // Fechas: más cerca, mejor (convertimos a negativo para ordenar asc)
-  const dDep = dep.transactionDate?.toDate?.() ?? new Date(dep.transactionDate);
-  const dSale = sale.saleDate?.toDate?.() ?? new Date(sale.saleDate);
-  const daysDiff = Math.abs(dDep - dSale) / 86400000;
-  const sDate = Math.max(0, dayWindow - daysDiff); // entre 0 y 1 aprox si dayWindow=1
-
-  return sVendor + sStore + sReserved + sDate;
-}
-
-/** --- Helpers comunes para fetch de candidatos --- **/
-async function fetchDepositCandidatesForSale(sale, opts) {
-  const { dayWindow } = opts;
-  const bank = GATEWAY_TO_BANK(sale.paymentGateway);
-  const saleDate = sale.saleDate?.toDate?.() ?? new Date(sale.saleDate);
-
-  const from = new Date(saleDate.getTime() - dayWindow * 86400000);
-  const to = new Date(saleDate.getTime() + dayWindow * 86400000);
-
-  // status in ['disponible','reservado'] requiere índice
-  const q = query(
-    collection(db, 'deposits'),
-    where('bank', '==', bank),
-    where('transactionDate', '>=', Timestamp.fromDate(from)),
-    where('transactionDate', '<=', Timestamp.fromDate(to)),
-    where('status', 'in', ['disponible', 'reservado'])
-  );
-
-  const snap = await getDocs(q);
-  let list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-  // calcular remainingAmount si no existe
-  list = list.map(d => {
-    const mt = Number(d.matchedTotal || 0);
-    const total = Number(d.amount || 0);
-    return {
-      ...d,
-      matchedTotal: mt,
-      remainingAmount: Number((total - mt).toFixed(2))
-    };
-  });
-
-  // Si es reservado, estrechamos por vendedor/tienda
-  list = list.filter(d => {
-    if (d.status === 'reservado') {
-      if (sale.vendorRef?.id && d.vendorId?.id && sale.vendorRef.id !== d.vendorId.id)
-        return false;
-      if (sale.storeId?.id && d.storeId?.id && sale.storeId.id !== d.storeId.id)
-        return false;
-    }
-    return withinDays(d.transactionDate, saleDate, dayWindow) && d.remainingAmount > 0;
-  });
-
-  // ordenar por score (más alto primero)
-  list.sort((a, b) => scoreDepositForSale(b, sale, dayWindow) - scoreDepositForSale(a, sale, dayWindow));
-  return list;
-}
-
-async function fetchSaleCandidatesForDeposit(dep, opts) {
-  const { dayWindow } = opts;
-  const gatewayBank = strip(dep.bank);
-  const saleDate = dep.transactionDate?.toDate?.() ?? new Date(dep.transactionDate);
-
-  const from = new Date(saleDate.getTime() - dayWindow * 86400000);
-  const to = new Date(saleDate.getTime() + dayWindow * 86400000);
-
-  const q = query(
+  const qRef = query(
     collection(db, 'shopifySales'),
     where('saleDate', '>=', Timestamp.fromDate(from)),
     where('saleDate', '<=', Timestamp.fromDate(to)),
-    where('status', '==', 'pendiente') // tu estado original; si no existe, quítalo
+    orderBy('saleDate', 'desc')
   );
 
-  const snap = await getDocs(q);
-  let list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const snap = await getDocs(qRef);
+  const depRem = remaining(dep.amount, dep.matchedTotal);
 
-  list = list
-    .map(s => {
-      const mt = Number(s.matchedTotal || 0);
-      const total = Number(s.grossPayments || 0);
-      return {
-        ...s,
-        matchedTotal: mt,
-        remainingAmount: Number((total - mt).toFixed(2)),
-        mappedBank: GATEWAY_TO_BANK(s.paymentGateway)
-      };
-    })
-    .filter(s => s.remainingAmount > 0 && strip(s.mappedBank) === gatewayBank)
-    .filter(s => withinDays(s.saleDate, saleDate, dayWindow));
+  const allowed = new Set([ES.UNMATCHED, ES.PENDING_REVIEW, ES.PENDIENTE, 'partial', '', null, undefined]);
+  const list = [];
 
-  // preferimos las que coincidan en vendor/store si el depósito está reservado
-  list.sort((a, b) => {
-    const aScore =
-      (dep.vendorId?.id && a.vendorRef?.id === dep.vendorId.id ? 5 : 0) +
-      (dep.storeId?.id && a.storeId?.id === dep.storeId.id ? 3 : 0);
-    const bScore =
-      (dep.vendorId?.id && b.vendorRef?.id === dep.vendorId.id ? 5 : 0) +
-      (dep.storeId?.id && b.storeId?.id === dep.storeId.id ? 3 : 0);
-    return bScore - aScore;
+  snap.forEach(s => {
+    const x = s.data();
+    const sBank = x.bankKey || normalizeBankKey(x.paymentGateway || x.bank);
+    if (sBank !== bankKey) return;
+
+    const sDate = toDate(x.saleDate);
+    const sRem  = remaining(x.grossPayments, x.matchedTotal);
+    if (sRem <= 0.009) return;
+
+    const status = String(x.reconciliationStatus || '').toLowerCase();
+    if (!allowed.has(status)) return;
+
+    let score = 0;
+    if (dep.status === ES.RESERVADO) {
+      if (dep.vendorId?.id && x.vendorRef?.id === dep.vendorId.id) score += 5;
+      if (dep.storeId?.id  && x.storeId?.id  === dep.storeId.id)   score += 3;
+    }
+    const daysDiff = Math.abs(sDate - depDate) / 86400000;
+    score += Math.max(0, dayWindow - daysDiff);
+
+    list.push({
+      id: s.id,
+      orderId: x.orderId,
+      saleDate: sDate,
+      staffMemberName: x.staffMemberName || '',
+      storeName: x.storeName || x.posLocationName || '',
+      grossPayments: round2(x.grossPayments),
+      matchedTotal: round2(x.matchedTotal),
+      remainingAmount: sRem,
+      reconciliationStatus: status,
+      score
+    });
   });
 
+  list.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return Math.abs(depRem - a.remainingAmount) - Math.abs(depRem - b.remainingAmount);
+  });
   return list;
 }
 
-/** --- APLICADORES (actualizan ambos lados en batch) --- **/
-function applySaleWithDeposits(batch, saleSnapOrPlain, saleId, pickedDeposits) {
-  const sale = saleSnapOrPlain.data ? saleSnapOrPlain.data() : saleSnapOrPlain;
-  const needed = rem(sale.grossPayments, sale.matchedTotal);
-  let accumulated = 0;
+export async function fetchDepositCandidatesForSale(sale, { dayWindow = 1, tolerance = 0 } = {}) {
+  const saleDate = toDate(sale.saleDate);
+  const bankKey = sale.bankKey || normalizeBankKey(sale.paymentGateway || sale.bank);
+  if (!saleDate || isNaN(saleDate)) return [];
 
-  for (const dep of pickedDeposits) {
-    const toUse = Math.min(dep.remainingAmount, needed - accumulated);
-    accumulated += toUse;
+  const from = dayStart(new Date(saleDate.getTime() - dayWindow * 86400000));
+  const to   = dayEnd(  new Date(saleDate.getTime() + dayWindow * 86400000));
 
-    const depRef = doc(db, 'deposits', dep.id);
-    const depMatchedTotal = Number(dep.matchedTotal || 0) + toUse;
-    const depRemaining = Number((dep.amount - depMatchedTotal).toFixed(2));
-    const newSaleRefArr = (dep.saleRef || []).concat(doc(db, 'shopifySales', saleId));
-
-    batch.update(depRef, {
-      saleRef: newSaleRefArr,
-      matchedTotal: depMatchedTotal,
-      remainingAmount: depRemaining,
-      status: depRemaining <= 0 ? 'liquidado' : dep.status,
-      orderId: sale.orderId,
-      liquidationDate: serverTimestamp(),
-      settledBy: 'auto'
-    });
-  }
-
-  const saleRef = doc(db, 'shopifySales', saleId);
-  const newSaleMatched = Number(sale.matchedTotal || 0) + accumulated;
-  const saleRemaining = Number((sale.grossPayments - newSaleMatched).toFixed(2));
-  batch.update(saleRef, {
-    matchedDepositRef: (sale.matchedDepositRef || []).concat(
-      pickedDeposits.map(d => doc(db, 'deposits', d.id))
-    ),
-    matchedTotal: newSaleMatched,
-    remainingAmount: saleRemaining,
-    reconciliationStatus: saleRemaining <= 0 ? 'matched' : 'partial',
-    reconciliationDate: serverTimestamp()
-  });
-}
-
-function applyDepositWithSales(batch, depSnapOrPlain, depId, pickedSales) {
-  const dep = depSnapOrPlain.data ? depSnapOrPlain.data() : depSnapOrPlain;
-  const needed = rem(dep.amount, dep.matchedTotal);
-  let accumulated = 0;
-
-  for (const sale of pickedSales) {
-    const toUse = Math.min(sale.remainingAmount, needed - accumulated);
-    accumulated += toUse;
-
-    const saleRef = doc(db, 'shopifySales', sale.id);
-    const saleMatchedNew = Number(sale.matchedTotal || 0) + toUse;
-    const saleRemaining = Number((sale.grossPayments - saleMatchedNew).toFixed(2));
-    const newMatDep = (sale.matchedDepositRef || []).concat(doc(db, 'deposits', depId));
-
-    batch.update(saleRef, {
-      matchedDepositRef: newMatDep,
-      matchedTotal: saleMatchedNew,
-      remainingAmount: saleRemaining,
-      reconciliationStatus: saleRemaining <= 0 ? 'matched' : 'partial',
-      reconciliationDate: serverTimestamp()
-    });
-  }
-
-  const depRef = doc(db, 'deposits', depId);
-  const depMatchedNew = Number(dep.matchedTotal || 0) + accumulated;
-  const depRemaining = Number((dep.amount - depMatchedNew).toFixed(2));
-  batch.update(depRef, {
-    matchedTotal: depMatchedNew,
-    remainingAmount: depRemaining,
-    status: depRemaining <= 0 ? 'liquidado' : dep.status,
-    liquidationDate: serverTimestamp(),
-    settledBy: 'auto'
-  });
-}
-
-/** --- API PÚBLICA --- **/
-
-// Desde una VENTA → buscar DEPÓSITOS
-export async function linkSaleToDeposits(saleSnapOrPlain, opts = {}) {
-  const { tolerance = 0, dayWindow = 1 } = opts;
-  const sale = saleSnapOrPlain.data ? saleSnapOrPlain.data() : saleSnapOrPlain;
-  const saleId = saleSnapOrPlain.id || sale.id;
-
-  const remaining = rem(sale.grossPayments, sale.matchedTotal);
-  if (remaining <= 0) return { status: 'already-matched' };
-
-  const candidates = await fetchDepositCandidatesForSale(sale, { dayWindow });
-  if (!candidates.length) {
-    // no hay nada cercano → review sin candidatos
-    const b = writeBatch(db);
-    b.update(doc(db, 'shopifySales', saleId), {
-      reconciliationStatus: 'review',
-      candidateDepositIds: [],
-      reconciliationDate: serverTimestamp()
-    });
-    await b.commit();
-    return { status: 'review', candidates: [] };
-  }
-
-  // probamos combinaciones (1 ó 2) exactas
-  const exact = combosUpTo2(candidates, remaining, tolerance);
-  if (!exact.length) {
-    // dejar algunas sugerencias
-    const top = candidates.slice(0, 5).map(c => c.id);
-    const b = writeBatch(db);
-    b.update(doc(db, 'shopifySales', saleId), {
-      reconciliationStatus: 'review',
-      candidateDepositIds: top,
-      reconciliationDate: serverTimestamp()
-    });
-    await b.commit();
-    return { status: 'review', candidates: top };
-  }
-
-  const pick = exact[0];
-  const batch = writeBatch(db);
-  applySaleWithDeposits(batch, sale, saleId, pick);
-  await batch.commit();
-  return { status: 'matched', used: pick.map(p => p.id) };
-}
-
-// Desde un DEPÓSITO → buscar VENTAS
-export async function linkDepositToSales(depSnapOrPlain, opts = {}) {
-  const { tolerance = 0, dayWindow = 1 } = opts;
-  const dep = depSnapOrPlain.data ? depSnapOrPlain.data() : depSnapOrPlain;
-  const depId = depSnapOrPlain.id || dep.id;
-
-  const remaining = rem(dep.amount, dep.matchedTotal);
-  if (remaining <= 0) return { status: 'already-matched' };
-
-  const candidates = await fetchSaleCandidatesForDeposit(dep, { dayWindow });
-  if (!candidates.length) {
-    const b = writeBatch(db);
-    b.update(doc(db, 'deposits', depId), {
-      pendingReason: 'Sin ventas cercanas',
-      candidateSaleIds: []
-    });
-    await b.commit();
-    return { status: 'review', candidates: [] };
-  }
-
-  const exact = combosUpTo2(
-    candidates.map(s => ({ ...s, amount: s.grossPayments, remainingAmount: s.remainingAmount })),
-    remaining,
-    tolerance
+  const qRef = query(
+    collection(db, 'deposits'),
+    where('transactionDate', '>=', Timestamp.fromDate(from)),
+    where('transactionDate', '<=', Timestamp.fromDate(to)),
+    orderBy('transactionDate', 'desc')
   );
 
-  if (!exact.length) {
-    const top = candidates.slice(0, 5).map(s => s.id);
-    const b = writeBatch(db);
-    b.update(doc(db, 'deposits', depId), {
-      pendingReason: 'Ambiguedad de ventas',
-      candidateSaleIds: top
-    });
-    await b.commit();
-    return { status: 'review', candidates: top };
-  }
+  const snap = await getDocs(qRef);
+  const target = remaining(sale.grossPayments, sale.matchedTotal);
 
-  const pick = exact[0];
-  const batch = writeBatch(db);
-  applyDepositWithSales(batch, dep, depId, pick);
-  await batch.commit();
-  return { status: 'matched', used: pick.map(p => p.id) };
+  const allowed = new Set([ES.DISPONIBLE, ES.PARCIAL, ES.RESERVADO, ES.UNMATCHED, 'partial', 'unmatched', '', null, undefined]);
+  const list = [];
+  snap.forEach(d => {
+    const x = d.data();
+    const dBank = x.bankKey || normalizeBankKey(x.bank);
+    if (dBank !== bankKey) return;
+
+    const status = String(x.status || '').toLowerCase();
+    if (!allowed.has(status)) return;
+
+    const amtRemaining = remaining(x.amount, x.matchedTotal);
+    if (amtRemaining <= 0.009) return;
+
+    let score = 0;
+    if (status === ES.RESERVADO) {
+      if (sale.vendorRef?.id && x.vendorId?.id && sale.vendorRef.id === x.vendorId.id) score += 5;
+      if (sale.storeId?.id  && x.storeId?.id  && sale.storeId.id === x.storeId.id)     score += 3;
+    }
+
+    const dDate = toDate(x.transactionDate);
+    const daysDiff = Math.abs(dDate - saleDate) / 86400000;
+    score += Math.max(0, dayWindow - daysDiff);
+
+    list.push({
+      id: d.id,
+      transactionDate: dDate,
+      vendorName: x.vendorName || '',
+      storeName: x.storeName || '',
+      amount: round2(x.amount),
+      matchedTotal: round2(x.matchedTotal),
+      remainingAmount: amtRemaining,
+      status,
+      score
+    });
+  });
+
+  list.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return Math.abs(target - a.remainingAmount) - Math.abs(target - b.remainingAmount);
+  });
+  return list;
+}
+
+/* =========================
+ * Conciliar / Devolver / Revertir
+ * ========================= */
+
+/**
+ * Conciliación manual (depósito -> ventas).
+ * - NO elimina ventas.
+ * - Setea vendorName/storeName del depósito (si hay un único vendedor/tienda coherente).
+ * - Guarda matches simétricos para poder revertir:
+ *   - En depósito: matches: [{ saleId, amount }]
+ *   - En venta:    matches: [{ depositId, amount }]
+ */
+export async function manualSettleDeposit(deposit, selectedSales, {
+  finalStatus = ES.LIQUIDADO,
+  comment = 'Conciliado manualmente',
+  vendorRef = null
+} = {}) {
+  const depRef = doc(db, 'deposits', deposit.id);
+
+  await runTransaction(db, async (tx) => {
+    const depSnap = await tx.get(depRef);
+    if (!depSnap.exists()) throw new Error('Depósito no existe');
+    const dep = depSnap.data();
+
+    const depAmount  = Number(dep.amount || 0);
+    let depMatched   = Number(dep.matchedTotal || 0);
+
+    // para setear vendor/tienda en el depósito
+    let vendorSeen = null;
+    let storeSeen  = null;
+    let consistentVendor = true;
+    let consistentStore  = true;
+
+    const usedRefs = [];
+    const matchesForDeposit = []; // [{ saleId, amount }]
+
+    for (const s of selectedSales) {
+      const saleRef = doc(db, 'shopifySales', s.id);
+      const saleSnap = await tx.get(saleRef);
+      if (!saleSnap.exists()) continue;
+
+      const sale = saleSnap.data();
+      const total   = Number(sale.grossPayments || 0);
+      const matched = Number(sale.matchedTotal || 0);
+      const saleRem = Math.max(0, round2(total - matched));
+      const depRem  = Math.max(0, round2(depAmount - depMatched));
+      if (depRem <= 0.009) break;
+
+      const toUse = Math.min(saleRem, depRem);
+      if (toUse <= 0.009) continue;
+
+      // capturar vendedor/tienda
+      const vName = sale.staffMemberName || '';
+      const sName = sale.storeName || sale.posLocationName || '';
+      if (vName) {
+        if (vendorSeen == null) vendorSeen = vName;
+        else if (vendorSeen !== vName) consistentVendor = false;
+      }
+      if (sName) {
+        if (storeSeen == null) storeSeen = sName;
+        else if (storeSeen !== sName) consistentStore = false;
+      }
+
+      const newSaleMatched = round2(matched + toUse);
+      const newSaleRem     = Math.max(0, round2(total - newSaleMatched));
+
+      // actualizar venta (agregamos match simétrico)
+      tx.update(saleRef, {
+        matchedTotal: newSaleMatched,
+        remainingAmount: newSaleRem,
+        reconciliationStatus: newSaleRem <= 0.009 ? 'matched' : 'partial',
+        matchedDepositRef: arrayUnion(depRef),
+        matches: arrayUnion({ depositId: deposit.id, amount: toUse }),
+        history: arrayUnion({
+          action: 'manual_match',
+          details: `Matched L ${toUse.toFixed(2)} con depósito ${deposit.id}`,
+          timestamp: Timestamp.now(),
+          user: vendorRef || null,
+          userName: ''
+        })
+      });
+
+      depMatched = round2(depMatched + toUse);
+      usedRefs.push(saleRef);
+      matchesForDeposit.push({ saleId: saleRef.id, amount: toUse });
+    }
+
+    const depRemAfter = Math.max(0, round2(depAmount - depMatched));
+    const newStatus = depRemAfter <= 0.009 ? finalStatus : ES.PARCIAL;
+
+    // setear vendor/store si son consistentes
+    const vendorNameToSet = consistentVendor ? (vendorSeen || dep.vendorName || '') : (dep.vendorName || '');
+    const storeNameToSet  = consistentStore  ? (storeSeen  || dep.storeName  || '') : (dep.storeName  || '');
+
+    tx.update(depRef, {
+      matchedTotal: depMatched,
+      remainingAmount: depRemAfter,
+      status: newStatus,
+      vendorId: vendorRef || dep.vendorId || null,
+      vendorName: vendorNameToSet,
+      storeName: storeNameToSet,
+      saleRef: usedRefs.length ? arrayUnion(...usedRefs) : (dep.saleRef || []),
+      matches: matchesForDeposit.length ? arrayUnion(...matchesForDeposit) : (dep.matches || []),
+      reconciliationScore: 100,
+      history: arrayUnion({
+        action: 'manual_settle',
+        details: comment || 'Conciliado manualmente',
+        links: matchesForDeposit,
+        timestamp: Timestamp.now(),
+        user: vendorRef || null,
+        userName: ''
+      }),
+      liquidationDate: (newStatus === ES.LIQUIDADO || newStatus === ES.AUTO_LIQ)
+        ? Timestamp.now()
+        : (dep.liquidationDate || null)
+    });
+  });
+}
+
+/** Marcar depósito como devuelto (no toca ventas) */
+export async function markDepositAsRefunded(deposit, {
+  comment = 'Devuelto al cliente',
+  vendorRef = null
+} = {}) {
+  const depRef = doc(db, 'deposits', deposit.id);
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(depRef);
+    if (!snap.exists()) throw new Error('Depósito no existe');
+    const dep = snap.data();
+    if (isFinal(dep.status)) throw new Error('Depósito ya finalizado');
+
+    tx.update(depRef, {
+      status: ES.DEVUELTO,
+      matchedTotal: 0,
+      remainingAmount: 0,
+      settledBy: 'refund',
+      liquidationDate: Timestamp.now(),
+      history: arrayUnion({
+        action: 'refund',
+        details: comment || 'Devuelto al cliente',
+        timestamp: Timestamp.now(),
+        user: vendorRef || null,
+        userName: ''
+      })
+    });
+  });
+}
+
+/**
+ * Revertir depósito:
+ * - Vuelve el depósito a Disponible (matchedTotal=0, remaining=amount).
+ * - Recorre dep.matches y resta esos montos en cada venta.
+ * - Limpia refs (matchedDepositRef / matches) en las ventas afectadas.
+ * - **Nuevo**: también limpia vendedor/tienda del depósito.
+ */
+export async function revertDeposit(deposit, {
+  reason = 'Reversión manual',
+  userRef = null
+} = {}) {
+  const depRef = doc(db, 'deposits', deposit.id);
+
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(depRef);
+    if (!snap.exists()) throw new Error('Depósito no existe');
+    const dep = snap.data();
+    const statusLc = String(dep.status || '').toLowerCase();
+    if (!(FINAL_STATES.includes(statusLc) || statusLc === ES.PARCIAL)) {
+      throw new Error('El depósito no está finalizado ni parcial');
+    }
+
+    const matches = Array.isArray(dep.matches) ? dep.matches : []; // [{ saleId, amount }]
+
+    // Revertir en ventas
+    for (const m of matches) {
+      if (!m?.saleId || !m?.amount) continue;
+      const saleRef = doc(db, 'shopifySales', m.saleId);
+      const sSnap = await tx.get(saleRef);
+      if (!sSnap.exists()) continue;
+
+      const sale = sSnap.data();
+      const total   = Number(sale.grossPayments || 0);
+      const matched = Number(sale.matchedTotal || 0);
+      const toRemove = Number(m.amount || 0);
+
+      const newMatched = round2(Math.max(0, matched - toRemove));
+      const newRem     = Math.max(0, round2(total - newMatched));
+      const newStatus  = newRem <= 0.009 ? 'matched' : ES.PENDING_REVIEW;
+
+      tx.update(saleRef, {
+        matchedTotal: newMatched,
+        remainingAmount: newRem,
+        reconciliationStatus: newStatus,
+        matchedDepositRef: arrayRemove(depRef),
+        matches: arrayRemove({ depositId: deposit.id, amount: toRemove }),
+        history: arrayUnion({
+          action: 'revert_match',
+          details: `Reversión: se liberó L ${toRemove.toFixed(2)} del depósito ${deposit.id}`,
+          timestamp: Timestamp.now(),
+          user: userRef || null,
+          userName: ''
+        })
+      });
+    }
+
+    // Resetear depósito (incluye limpiar vendedor/tienda)
+    tx.update(depRef, {
+      status: ES.DISPONIBLE,
+      matchedTotal: 0,
+      remainingAmount: Number(dep.amount || 0),
+      saleRef: [],
+      matches: [],
+      liquidationDate: null,
+      // 👇 NUEVO: limpiar vendedor/tienda
+      vendorId: null,
+      vendorName: '',
+      storeName: '',
+      history: arrayUnion({
+        action: 'revert',
+        details: reason,
+        timestamp: Timestamp.now(),
+        user: userRef || null,
+        userName: ''
+      })
+    });
+  });
+}
+
+/* =========================
+ * Auto (opcional)
+ * ========================= */
+export async function linkDepositToSales(deposit, options = { tolerance: 0, dayWindow: 1 }) {
+  const depRem = remaining(deposit.amount, deposit.matchedTotal);
+  if (depRem <= 0.009) return;
+  const cands = await fetchSaleCandidatesForDeposit(deposit, options);
+  if (!cands.length) return;
+
+  cands.sort((a,b) =>
+    Math.abs(depRem - a.remainingAmount) - Math.abs(depRem - b.remainingAmount)
+  );
+  const best = cands[0];
+  const tol = Number(options.tolerance || 0);
+
+  if (Math.abs(best.remainingAmount - depRem) <= tol) {
+    await manualSettleDeposit(deposit, [{ id: best.id }], {
+      finalStatus: ES.AUTO_LIQ,
+      comment: 'Auto-conciliado por el sistema'
+    });
+  }
+}
+
+export async function linkSaleToDeposits(sale, options = { tolerance: 0, dayWindow: 1 }) {
+  const saleRem = remaining(sale.grossPayments, sale.matchedTotal);
+  if (saleRem <= 0.009) return;
+
+  const cands = await fetchDepositCandidatesForSale(sale, options);
+  if (!cands.length) return;
+
+  cands.sort((a,b) =>
+    Math.abs(saleRem - a.remainingAmount) - Math.abs(saleRem - b.remainingAmount)
+  );
+  const best = cands[0];
+  const tol = Number(options.tolerance || 0);
+
+  if (Math.abs(best.remainingAmount - saleRem) <= tol) {
+    const depLite = { id: best.id, amount: best.amount, matchedTotal: (best.amount - best.remainingAmount) };
+    await manualSettleDeposit(depLite, [{ id: sale.id }], {
+      finalStatus: ES.AUTO_LIQ,
+      comment: 'Auto-conciliado por el sistema (desde venta)'
+    });
+  }
 }

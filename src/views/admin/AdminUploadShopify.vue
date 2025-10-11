@@ -2,14 +2,17 @@
 import { ref, computed } from 'vue';
 import { db } from '@/firebase';
 import {
-  collection, writeBatch, doc, serverTimestamp, query, where, getDocs, Timestamp, orderBy, arrayUnion, updateDoc
+  collection, writeBatch, doc, serverTimestamp, query, where, getDocs, Timestamp
 } from 'firebase/firestore';
 import * as XLSX from 'xlsx';
 import AlertModal from '@/components/modals/AlertModal.vue';
 import { useAuthStore } from '@/stores/authStore';
 
+/* ==================== Auth ==================== */
 const authStore = useAuthStore();
 
+/* ==================== UI state ==================== */
+const selectedFile = ref(null);
 const fileName = ref('Ningún archivo seleccionado');
 const excelHeaders = ref([]);
 const excelData = ref([]);
@@ -17,116 +20,102 @@ const isProcessing = ref(false);
 const isAlertOpen = ref(false);
 const alertMessage = ref('');
 
+/* ==================== BankKey ==================== */
+const normalizeBankKey = (raw = '') => {
+  const s = String(raw || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\./g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+  if (s.includes('CREDOMATIC') || s === 'BAC' || s.includes('DEP B BAC') || s.includes('DEP B. BAC')) return 'BAC';
+  if (s.includes('FICO')) return 'FICOHSA';
+  if (s.includes('ATLANT')) return 'ATLANTIDA';
+  if (s.includes('PAIS')) return 'BANPAIS';
+  if (s.includes('OCCIDENT')) return 'OCCIDENTE';
+  if (s.includes('BANRURAL')) return 'BANRURAL';
+  return s || 'DESCONOCIDO';
+};
+
+/* ==================== Mapeo de columnas ==================== */
 const dbFields = ref([
-  { key: 'orderId',           label: 'Order name (# de Orden)',          required: true,  mappedColumn: '' },
-  { key: 'saleDate',          label: 'Day (Fecha)',                      required: true,  mappedColumn: '' },
-  { key: 'paymentGateway',    label: 'Payment gateway (Banco)',          required: true,  mappedColumn: '' },
-  { key: 'grossPayments',     label: 'Gross payments (Monto)',           required: true,  mappedColumn: '' },
-  { key: 'staffMemberName',   label: 'Staff member name (Vendedor)',     required: true,  mappedColumn: '' },
-  { key: 'posLocationName',   label: 'Pos location name (Sucursal)',     required: true,  mappedColumn: '' },
+  { key: 'paymentGateway', label: 'Banco/Pasarela (ej. BAC Credomatic)', required: true,  mappedColumn: '' }, // A
+  { key: 'orderId',        label: 'Número de Orden',                       required: true,  mappedColumn: '' }, // B
+  { key: 'saleDate',       label: 'Fecha (dd/mm/aaaa)',                    required: true,  mappedColumn: '' }, // C
+  { key: 'posLocationName',label: 'Tienda',                                required: false, mappedColumn: '' }, // D
+  { key: 'staffMemberName',label: 'Vendedor',                              required: false, mappedColumn: '' }, // E
+  { key: 'grossPayments',  label: 'Monto / Net payment',                   required: true,  mappedColumn: '' }, // H o F
+  { key: 'refunded',       label: 'Refunded (opcional)',                   required: false, mappedColumn: '' }, // G
 ]);
 
 const showMappingUI = computed(() => excelHeaders.value.length > 0);
+const previewData  = computed(() => excelData.value.length < 2 ? [] : excelData.value.slice(1, 6));
 
-const showAlert = (msg) => { alertMessage.value = msg; isAlertOpen.value = true; };
+/* ==================== Fecha ==================== */
+/** Devuelve un Date LOCAL a medianoche sin cambiar el día */
+const parseDateLocal = (input) => {
+  if (!input) return null;
 
-const resetFileState = () => {
-  fileName.value = 'Ningún archivo seleccionado';
-  excelHeaders.value = [];
-  excelData.value = [];
-  dbFields.value.forEach(f => f.mappedColumn = '');
-  const fileInput = document.getElementById('shopify-file-input');
-  if(fileInput) fileInput.value = '';
-};
-
-// -------------------------
-// Helpers
-// -------------------------
-const parseDate = (dateInput) => {
-  if (!dateInput) return null;
-  if (typeof dateInput === 'number' && dateInput > 1) {
-    const date = new Date(Math.round((dateInput - 25569) * 86400 * 1000));
-    return new Date(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+  // número serial de Excel
+  if (typeof input === 'number' && input > 1) {
+    // 25569 = 1/1/1970; esto nos da fecha UTC; la convertimos a LOCAL sin mover el día
+    const utc = new Date(Math.round((input - 25569) * 86400 * 1000));
+    return new Date(utc.getFullYear(), utc.getMonth(), utc.getDate());
   }
-  if (dateInput instanceof Date) return new Date(dateInput.getFullYear(), dateInput.getMonth(), dateInput.getDate());
-  const finalAttempt = new Date(dateInput);
-  return !isNaN(finalAttempt.getTime())
-    ? new Date(finalAttempt.getFullYear(), finalAttempt.getMonth(), finalAttempt.getDate())
-    : null;
-};
 
-const normalize = (s) => (s || '')
-  .toString()
-  .toLowerCase()
-  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-  .replace(/[^a-z0-9 ]/g, ' ')
-  .replace(/\s+/g, ' ')
-  .trim();
-
-const bankMap = [
-  { contains: ['bac', 'credomatic'], std: 'BAC Credomatic' },
-  { contains: ['ficohsa'],           std: 'FICOHSA' },
-  { contains: ['atlantida', 'atl'],  std: 'ATLANTIDA' },
-  { contains: ['occidente'],         std: 'OCCIDENTE' },
-  { contains: ['banpais', 'banpa'],  std: 'BANPAIS' },
-  { contains: ['banrural'],          std: 'BANRURAL' },
-];
-
-const normalizeBank = (raw) => {
-  const n = normalize(raw);
-  for (const rule of bankMap) {
-    if (rule.contains.some(k => n.includes(k))) return rule.std;
-  }
-  return raw || '';
-};
-
-const amountEquals = (a, b, tol = 1.0) => Math.abs((Number(a)||0) - (Number(b)||0)) <= tol;
-
-const toStartOfDay = (d) => { const x = new Date(d); x.setHours(0,0,0,0); return x; };
-const toEndOfDay   = (d) => { const x = new Date(d); x.setHours(23,59,59,999); return x; };
-
-const plusDays = (d, days) => { const x = new Date(d); x.setDate(x.getDate()+days); return x; };
-
-// Buscar usuario por display_name (igual ignorando acentos y mayúsculas)
-const findUserByDisplayName = async (name) => {
-  if (!name) return null;
-  const n = normalize(name);
-  // Traemos usuarios con una paginita (si tienes muchos usuarios, podríamos mejorar esto con un campo auxiliar)
-  const qUsers = query(collection(db, 'users'), orderBy('display_name'));
-  const snap = await getDocs(qUsers);
-  for (const docu of snap.docs) {
-    const d = docu.data();
-    if (normalize(d.display_name) === n) {
-      return { id: docu.id, ref: doc(db, 'users', docu.id), ...d };
+  // cadena dd/mm/aaaa
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    const parts = trimmed.split('/');
+    if (parts.length === 3) {
+      const d = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10) - 1;
+      let y = parseInt(parts[2], 10);
+      if (y < 100) y += 2000;
+      if (!isNaN(d) && !isNaN(m) && !isNaN(y)) {
+        return new Date(y, m, d);
+      }
     }
+    // Intento final con Date; luego fijo a medianoche local
+    const tryDate = new Date(trimmed);
+    if (!isNaN(tryDate)) return new Date(tryDate.getFullYear(), tryDate.getMonth(), tryDate.getDate());
+    return null;
   }
+
+  // Date
+  if (input instanceof Date && !isNaN(input)) {
+    return new Date(input.getFullYear(), input.getMonth(), input.getDate());
+  }
+
   return null;
 };
 
-// -------------------------
-// File handling
-// -------------------------
+/* ==================== Archivo ==================== */
 const handleFileChange = (event) => {
   const file = event.target.files[0];
   if (!file) return;
+
+  selectedFile.value = file;
   fileName.value = file.name;
 
   const reader = new FileReader();
   reader.onload = (e) => {
     try {
       const data = new Uint8Array(e.target.result);
+      // IMPORTANTE: cellDates:true conserva fechas reales cuando Excel las almacena como fechas
       const workbook = XLSX.read(data, { type: 'array', cellDates: true });
       const ws = workbook.Sheets[workbook.SheetNames[0]];
-      const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, dateNF: 'yyyy-mm-dd' });
+      const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+
       if (jsonData.length > 1) {
         excelHeaders.value = jsonData[0].map(String);
         excelData.value = jsonData;
       } else {
-        showAlert('El archivo Excel está vacío o no tiene un formato válido.');
+        showAlert('El archivo está vacío o no tiene un formato válido.');
         resetFileState();
       }
     } catch (error) {
-      console.error("Error al procesar el archivo Excel:", error);
+      console.error('Error al procesar el archivo:', error);
       showAlert('Hubo un error al leer el archivo. Asegúrate de que sea un formato válido.');
       resetFileState();
     }
@@ -134,272 +123,203 @@ const handleFileChange = (event) => {
   reader.readAsArrayBuffer(file);
 };
 
-// -------------------------
-// Conciliación automática
-// -------------------------
-const autoReconcileNewSales = async (createdSales) => {
-  // createdSales: array de { ref, data }
-  const amountTolerance = 1.0; // Lempiras
-  const dateWindowDays  = 1;   // ±1 día
-
-  for (const s of createdSales) {
-    try {
-      // 1) Datos base y normalizaciones
-      const saleBankStd = normalizeBank(s.data.paymentGateway);
-      const saleDate = s.data.saleDate.toDate ? s.data.saleDate.toDate() : s.data.saleDate;
-      const winStart = toStartOfDay(plusDays(saleDate, -dateWindowDays));
-      const winEnd   = toEndOfDay(plusDays(saleDate, dateWindowDays));
-
-      // 2) Trata de mapear vendedor → user/store
-      let vendorUser = null;
-      if (s.data.staffMemberName) {
-        vendorUser = await findUserByDisplayName(s.data.staffMemberName);
-        if (vendorUser) {
-          await updateDoc(s.ref, {
-            vendorRef: vendorUser.ref,
-            storeId: vendorUser.storeId || null,
-            storeName: vendorUser.storeName || null
-          });
-        }
-      }
-
-      // 3) Carga candidatos de depósitos
-      const qDeps = query(
-        collection(db, 'deposits'),
-        where('status', 'in', ['disponible', 'reservado']),
-        where('bank', '==', saleBankStd),
-        where('transactionDate', '>=', Timestamp.fromDate(winStart)),
-        where('transactionDate', '<=', Timestamp.fromDate(winEnd))
-      );
-      const snap = await getDocs(qDeps);
-      const candidates = snap.docs.map(d => ({ id: d.id, ref: d.ref, ...d.data() }))
-        .filter(d => amountEquals(d.amount, s.data.grossPayments, amountTolerance));
-
-      if (candidates.length === 0) {
-        // Nada encontrado → marcar pendiente revisión
-        await updateDoc(s.ref, {
-          reconciliationStatus: 'pendiente-revision',
-          status: 'pendiente',
-        });
-        continue;
-      }
-
-      // 4) Estrategia de selección
-      let pick = null;
-
-      // a) Prioriza reservados al mismo vendedor/tienda (si tenemos vendorUser)
-      if (vendorUser) {
-        const samePerson = candidates.filter(d =>
-          d.status === 'reservado' &&
-          d.vendorId?.id === vendorUser.id
-        );
-        if (samePerson.length === 1) pick = samePerson[0];
-        if (!pick && samePerson.length > 1) {
-          // el más cercano por fecha
-          samePerson.sort((a,b) => Math.abs(a.transactionDate.toDate() - saleDate) - Math.abs(b.transactionDate.toDate() - saleDate));
-          pick = samePerson[0];
-        }
-      }
-
-      // b) Si no hay pick aún: cualquier reservado
-      if (!pick) {
-        const reserved = candidates.filter(d => d.status === 'reservado');
-        if (reserved.length === 1) pick = reserved[0];
-        else if (reserved.length > 1) {
-          reserved.sort((a,b) => Math.abs(a.transactionDate.toDate() - saleDate) - Math.abs(b.transactionDate.toDate() - saleDate));
-          pick = reserved[0];
-        }
-      }
-
-      // c) Si todavía no: disponibles
-      if (!pick) {
-        const available = candidates.filter(d => d.status === 'disponible');
-        if (available.length === 1) pick = available[0];
-        else if (available.length > 1) {
-          available.sort((a,b) => Math.abs(a.transactionDate.toDate() - saleDate) - Math.abs(b.transactionDate.toDate() - saleDate));
-          pick = available[0];
-        }
-      }
-
-      // 5) Aplica actualización
-      if (!pick) {
-        await updateDoc(s.ref, {
-          reconciliationStatus: 'pendiente-revision',
-          status: 'pendiente',
-        });
-        continue;
-      }
-
-      const diferencia = Number((s.data.grossPayments || 0) - (pick.amount || 0));
-
-      // batch pequeño por venta para mantenerlo simple y seguro
-      const batch = writeBatch(db);
-
-      // deposit update → LIQUIDADO
-      const historyEntry = {
-        action: 'Liquidado',
-        timestamp: serverTimestamp(),
-        details: `Conciliado automáticamente con orden ${s.data.orderId}`,
-        user: authStore?.user?.uid ? doc(db, 'users', authStore.user.uid) : null,
-        userName: authStore?.user?.display_name || 'Sistema'
-      };
-
-      batch.update(pick.ref, {
-        status: 'liquidado',
-        liquidationDate: serverTimestamp(),
-        vendorId: pick.vendorId || (vendorUser ? vendorUser.ref : null),
-        vendorName: pick.vendorName || (vendorUser ? vendorUser.display_name : s.data.staffMemberName || null),
-        storeId: pick.storeId || (vendorUser?.storeId || null),
-        storeName: pick.storeName || (vendorUser?.storeName || s.data.posLocationName || null),
-        shopifyOrderId: s.data.orderId,
-        orderId: s.data.orderId,
-        orderTotal: s.data.grossPayments || 0,
-        diferencia,
-        saleRef: arrayUnion(s.ref),
-        history: arrayUnion(historyEntry)
-      });
-
-      // sale update
-      batch.update(s.ref, {
-        status: 'conciliada',
-        reconciliationStatus: 'conciliada',
-        reconciliationDate: serverTimestamp(),
-        matchedDepositRef: arrayUnion(pick.ref)
-      });
-
-      await batch.commit();
-
-    } catch (err) {
-      console.error('Error conciliando venta:', err);
-      try {
-        await updateDoc(s.ref, { reconciliationStatus: 'pendiente-revision' });
-      } catch {}
-    }
-  }
-};
-
-// -------------------------
-// Upload + conciliación
-// -------------------------
+/* ==================== Subida ==================== */
 const handleUpload = async () => {
   isProcessing.value = true;
+
+  // Validación de mapeo
+  if (dbFields.value.some(f => f.required && !f.mappedColumn)) {
+    showAlert('Por favor, mapea todas las columnas requeridas (*).');
+    isProcessing.value = false;
+    return;
+  }
+
+  const mapping = dbFields.value.reduce((acc, f) => ({ ...acc, [f.key]: f.mappedColumn }), {});
+  const rows = excelData.value.slice(1);
+
+  // Parseamos filas
+  const parsed = rows.map(row => {
+    const v = (key) => row[excelHeaders.value.indexOf(mapping[key])];
+
+    const bankRaw = String(v('paymentGateway') || '').trim();
+    const bankKey = normalizeBankKey(bankRaw);
+
+    const orderId = String(v('orderId') || '').trim();
+    const saleDate = parseDateLocal(v('saleDate'));
+    const storeName = String(v('posLocationName') || '').trim();
+    const vendorName = String(v('staffMemberName') || '').trim();
+
+    // monto: usamos 'net payment' si está mapeado, si no F (montodeposito)
+    let amtRaw = v('grossPayments');
+    const amount = Number(String(amtRaw || '0').replace(/[^0-9.-]+/g, ''));
+    const refunded = Number(String(v('refunded') || '0').replace(/[^0-9.-]+/g, ''));
+
+    if (!orderId || !saleDate || !(amount > 0)) return null;
+
+    return {
+      orderId,
+      saleDate,            // Date local
+      amount,
+      refunded,
+      bankRaw,
+      bankKey,
+      storeName,
+      vendorName
+    };
+  }).filter(Boolean);
+
+  if (parsed.length === 0) {
+    showAlert('No se encontraron filas con datos válidos (fecha, orden y monto) para procesar.');
+    isProcessing.value = false;
+    return;
+  }
+
+  // Evitar duplicados dentro del rango de fechas de archivo por orderId
+  const dates = parsed.map(r => r.saleDate);
+  const minDate = new Date(Math.min.apply(null, dates));
+  const maxDate = new Date(Math.max.apply(null, dates));
+
   try {
-    if (dbFields.value.some(f => f.required && !f.mappedColumn)) {
-      showAlert('Por favor, mapea todas las columnas requeridas (*).');
-      isProcessing.value = false;
-      return;
-    }
+    // Traemos ventas existentes en ventana por orderId
+    const q = query(
+      collection(db, 'shopifySales'),
+      where('saleDate', '>=', Timestamp.fromDate(minDate)),
+      where('saleDate', '<=', Timestamp.fromDate(maxDate))
+    );
+    const snap = await getDocs(q);
+    const existingOrders = new Set(snap.docs.map(d => String(d.data().orderId || '').trim()));
 
-    const mapping = dbFields.value.reduce((acc, field) => ({...acc, [field.key]: field.mappedColumn}), {});
-    const dataRows = excelData.value.slice(1);
-
-    // Prevenir duplicados por orderId
-    const orderIds = dataRows
-      .map(row => String(row[excelHeaders.value.indexOf(mapping.orderId)] || '').trim())
-      .filter(Boolean);
-
-    const existingSales = new Set();
-    if (orderIds.length > 0) {
-      for (let i = 0; i < orderIds.length; i += 30) {
-        const chunk = orderIds.slice(i, i + 30);
-        const qx = query(collection(db, "shopifySales"), where("orderId", "in", chunk));
-        const snapshot = await getDocs(qx);
-        snapshot.forEach(doc => existingSales.add(doc.data().orderId));
-      }
-    }
-
+    // Escribimos en batch
     const batch = writeBatch(db);
-    const createdSales = []; // { ref, data }
     let newCount = 0;
-    let skippedCount = 0;
+    let skipped = 0;
 
-    for (const row of dataRows) {
-      const orderId = String(row[excelHeaders.value.indexOf(mapping.orderId)] || '').trim();
-      if (!orderId) continue;
+    for (const r of parsed) {
+      if (existingOrders.has(r.orderId)) { skipped++; continue; }
 
-      if (existingSales.has(orderId)) {
-        skippedCount++;
-        continue;
-      }
+      const ref = doc(collection(db, 'shopifySales'));
+      batch.set(ref, {
+        orderId: r.orderId,
+        saleDate: Timestamp.fromDate(r.saleDate), // guardamos a medianoche local
+        grossPayments: r.amount,                  // usamos net payment como base de conciliación
+        refundedAmount: r.refunded || 0,
+        paymentGateway: r.bankRaw,
+        bankKey: r.bankKey,
 
-      const amount = parseFloat(String(row[excelHeaders.value.indexOf(mapping.grossPayments)] || '0').replace(/[^0-9.-]+/g, ''));
-      const date = parseDate(row[excelHeaders.value.indexOf(mapping.saleDate)]);
-      if (isNaN(amount) || amount <= 0 || !date) continue;
+        posLocationName: r.storeName || null,
+        staffMemberName: r.vendorName || null,
 
-      const paymentGateway = String(row[excelHeaders.value.indexOf(mapping.paymentGateway)] || '').trim();
-      const staffMemberName = String(row[excelHeaders.value.indexOf(mapping.staffMemberName)] || '').trim();
-      const posLocationName = String(row[excelHeaders.value.indexOf(mapping.posLocationName)] || '').trim();
-
-      const newSaleRef = doc(collection(db, "shopifySales"));
-      const newSaleData = {
-        orderId,
-        saleDate: Timestamp.fromDate(date),
-        paymentGateway,
-        grossPayments: amount,
-        staffMemberName,
-        posLocationName,
-        status: 'pendiente',
+        reconciliationStatus: 'pendiente',       // en español
+        matchedTotal: 0,
+        remainingAmount: r.amount,
+        matchedDepositRef: [],
         uploadDate: serverTimestamp(),
-        uploadedBy_uid: authStore?.user?.uid ? doc(db, 'users', authStore.user.uid) : null,
-        reconciliationStatus: 'pendiente'
-      };
+        createdBy_uid: authStore.user?.uid || null
+      });
 
-      batch.set(newSaleRef, newSaleData);
-      createdSales.push({ ref: newSaleRef, data: newSaleData });
+      existingOrders.add(r.orderId);
       newCount++;
     }
 
     if (newCount > 0) await batch.commit();
 
-    // Conciliación automática SOLO para lo nuevo
-    if (createdSales.length > 0) {
-      await autoReconcileNewSales(createdSales);
-    }
-
-    let message = `Proceso completado.\n- Se subieron ${newCount} ventas nuevas.`;
-    if (skippedCount > 0) message += `\n- Se omitieron ${skippedCount} ventas duplicadas.`;
-    message += `\n\nSe intentó conciliar automáticamente las ventas nuevas. Revisa estados en "Ver Depósitos" o crea una pantalla para revisar "pendiente-revision".`;
-    showAlert(message);
+    let msg = `Ventas subidas correctamente.\n- Nuevas: ${newCount}`;
+    if (skipped > 0) msg += `\n- Omitidas (orden repetida en rango): ${skipped}`;
+    showAlert(msg);
     resetFileState();
-  } catch (error) {
-    console.error("Error al subir ventas:", error);
-    showAlert('Ocurrió un error al guardar/conciliar las ventas.');
+  } catch (err) {
+    console.error(err);
+    showAlert(`Error al subir ventas: ${err.message}`);
   } finally {
     isProcessing.value = false;
   }
+};
+
+/* ==================== Helpers UI ==================== */
+const resetFileState = () => {
+  selectedFile.value = null;
+  fileName.value = 'Ningún archivo seleccionado';
+  excelHeaders.value = [];
+  excelData.value = [];
+  dbFields.value.forEach(f => (f.mappedColumn = ''));
+  const fileInput = document.getElementById('shopify-file-input');
+  if (fileInput) fileInput.value = '';
+};
+
+const showAlert = (msg) => {
+  alertMessage.value = msg;
+  isAlertOpen.value = true;
 };
 </script>
 
 <template>
   <div class="space-y-8">
     <div class="bg-white p-6 rounded-lg shadow">
-      <h2 class="text-2xl font-bold text-gray-800 mb-4">Subir Reporte de Ventas (Shopify)</h2>
+      <h2 class="text-2xl font-bold text-gray-800 mb-4">Subir Ventas Shopify</h2>
 
       <div class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-        <input type="file" id="shopify-file-input" class="hidden" accept=".xlsx, .xls, .csv" @change="handleFileChange">
-        <label for="shopify-file-input" class="cursor-pointer px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700">Seleccionar Archivo</label>
+        <input
+          id="shopify-file-input"
+          class="hidden"
+          type="file"
+          accept=".xlsx,.xls,.csv"
+          @change="handleFileChange"
+        />
+        <label for="shopify-file-input"
+               class="cursor-pointer px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700">
+          Seleccionar Archivo
+        </label>
         <p class="mt-4 text-sm text-gray-500">{{ fileName }}</p>
       </div>
-    </div>
 
-    <div v-if="showMappingUI" class="bg-white p-6 rounded-lg shadow">
-      <h3 class="text-lg font-bold text-gray-800">Mapeo de Columnas del Reporte</h3>
-      <p class="text-gray-600 mt-2 mb-6">Asigna la columna de tu archivo Excel a cada campo requerido.</p>
-      <div class="space-y-4 max-w-3xl">
-        <div v-for="field in dbFields" :key="field.key" class="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
-          <label class="font-medium text-gray-700">
-            {{ field.label }}<span v-if="field.required" class="text-red-500">*</span>
-          </label>
-          <select v-model="field.mappedColumn" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
-            <option value="">-- No usar --</option>
-            <option v-for="header in excelHeaders" :key="header" :value="header">{{ header }}</option>
-          </select>
+      <div v-if="excelHeaders.length > 0" class="mt-8">
+        <h3 class="text-lg font-bold text-gray-800">Paso 1: Mapea las columnas</h3>
+        <p class="text-gray-600 mt-2 mb-6">Asigna cada campo a la columna correspondiente de tu archivo.</p>
+
+        <div class="space-y-4 max-w-3xl">
+          <div v-for="field in dbFields" :key="field.key"
+               class="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+            <label :for="`map-${field.key}`" class="font-medium text-gray-700">
+              {{ field.label }} <span v-if="field.required" class="text-red-500">*</span>
+            </label>
+            <select :id="`map-${field.key}`"
+                    v-model="field.mappedColumn"
+                    class="w-full px-3 py-2 border border-gray-300 rounded-md">
+              <option value="">-- Selecciona columna --</option>
+              <option v-for="h in excelHeaders" :key="h" :value="h">{{ h }}</option>
+            </select>
+          </div>
         </div>
-      </div>
-      <div class="mt-8 flex justify-end">
-        <button @click="handleUpload" :disabled="isProcessing" class="px-6 py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 disabled:bg-green-300">
-          {{ isProcessing ? 'Procesando...' : 'Procesar, Subir y Conciliar' }}
-        </button>
+
+        <h4 class="text-lg font-bold text-gray-800 mt-8">Vista previa (primeras 5 filas)</h4>
+        <div class="mt-4 overflow-x-auto">
+          <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+            <tr>
+              <th v-for="h in excelHeaders" :key="h"
+                  class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                {{ h }}
+              </th>
+            </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200">
+            <tr v-for="(row, i) in previewData" :key="i">
+              <td v-for="(cell, j) in row" :key="j" class="px-6 py-4 whitespace-nowrap text-sm text-gray-800">
+                {{ cell }}
+              </td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="mt-8 flex justify-end">
+          <button
+            @click="handleUpload"
+            :disabled="isProcessing"
+            class="px-6 py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 disabled:bg-green-300">
+            {{ isProcessing ? 'Procesando...' : 'Procesar y Subir Ventas' }}
+          </button>
+        </div>
       </div>
     </div>
   </div>

@@ -1,208 +1,142 @@
 <script setup>
-import { ref, computed, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { db } from '@/firebase';
-import { collection, query, where, getDocs, doc, updateDoc, writeBatch, serverTimestamp, Timestamp } from 'firebase/firestore';
+import { doc } from 'firebase/firestore';
+import { fetchDepositCandidatesForSale, manualSettleDeposit, normalizeBankKey, ES } from '@/services/reconcileService';
 
 const props = defineProps({
-  modelValue: Boolean,
-  expenseToReconcile: Object,
+  modelValue: { type: Boolean, default: false },
+  sale: { type: Object, default: null },     // venta que se revisa
 });
 
-const emit = defineEmits(['update:modelValue', 'reconciliation-success']);
+const emit = defineEmits(['update:modelValue', 'settled']);
 
-const isOpen = computed({
+const open = computed({
   get: () => props.modelValue,
-  set: (value) => emit('update:modelValue', value)
+  set: (v) => emit('update:modelValue', v)
 });
 
-const isLoading = ref(false);
-const potentialMatches = ref([]);
-const selectedMatch = ref(null);
-const differenceComment = ref('');
+/* Parámetros de búsqueda */
+const dayWindow  = ref(1);   // ± 1 día
+const tolerance  = ref(10);  // L 10
+const candidates = ref([]);  // depósitos
+const loading    = ref(false);
+const selectedId = ref(null); // seleccionamos un depósito (1:1)
 
-const sourceStatus = computed(() => props.expenseToReconcile?.status);
-
-const differenceAmount = computed(() => {
-    if (!selectedMatch.value || !props.expenseToReconcile) return 0;
-    const manualExpense = sourceStatus.value === 'pendiente' ? props.expenseToReconcile : selectedMatch.value;
-    const importedExpense = sourceStatus.value === 'importado' || sourceStatus.value === 'revision-manual' ? props.expenseToReconcile : selectedMatch.value;
-    return importedExpense.amount - manualExpense.amount;
+/* Totales */
+const saleRemaining = computed(() => {
+  const s = props.sale || {};
+  return Math.max(0, Number(s.grossPayments || 0) - Number(s.matchedTotal || 0));
 });
 
-watch(() => props.expenseToReconcile, async (sourceExpense) => {
-    if (sourceExpense && isOpen.value) {
-        isLoading.value = true;
-        potentialMatches.value = [];
-        selectedMatch.value = null;
-        differenceComment.value = '';
-
-        const isSourceManual = sourceExpense.status === 'pendiente';
-        const statusToSearch = isSourceManual ? ['importado', 'revision-manual'] : ['pendiente'];
-        
-        const targetDate = sourceExpense.expenseDate.toDate();
-        const startDate = new Date(targetDate.getTime() - 5 * 24 * 60 * 60 * 1000);
-        const endDate = new Date(targetDate.getTime() + 5 * 24 * 60 * 60 * 1000);
-
-        try {
-            const q = query(collection(db, "expenses"),
-                where("status", "in", statusToSearch),
-                where("expenseDate", ">=", Timestamp.fromDate(startDate)),
-                where("expenseDate", "<=", Timestamp.fromDate(endDate))
-            );
-            const querySnapshot = await getDocs(q);
-            const matches = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            
-            matches.sort((a, b) => {
-                const diffA = Math.abs(a.amount - sourceExpense.amount);
-                const diffB = Math.abs(b.amount - sourceExpense.amount);
-                return diffA - diffB;
-            });
-
-            potentialMatches.value = matches;
-        } catch (error) {
-            console.error("Error al buscar coincidencias:", error);
-            alert("Error al buscar coincidencias. Es posible que falte un índice en Firestore. Revisa la consola (F12).");
-        } finally {
-            isLoading.value = false;
-        }
-    }
+watch(open, async (v) => {
+  if (v && props.sale) {
+    selectedId.value = null;
+    await loadCandidates();
+  }
 });
 
-const selectForConfirmation = (match) => {
-    selectedMatch.value = match;
-};
+async function loadCandidates() {
+  if (!props.sale) return;
+  loading.value = true;
+  try {
+    candidates.value = await fetchDepositCandidatesForSale(props.sale, {
+      dayWindow: dayWindow.value,
+      tolerance: tolerance.value
+    });
+  } finally {
+    loading.value = false;
+  }
+}
 
-const confirmReconciliation = async () => {
-    if (!selectedMatch.value) return;
+async function confirm() {
+  if (!selectedId.value) {
+    alert('Selecciona un depósito.');
+    return;
+  }
+  const dep = candidates.value.find(x => x.id === selectedId.value);
+  if (!dep) return;
 
-    if (differenceAmount.value !== 0 && !differenceComment.value.trim()) {
-        alert("Hay una diferencia en los montos. Por favor, añade un comentario de justificación.");
-        return;
-    }
-    isLoading.value = true;
-    try {
-        const batch = writeBatch(db);
-        const manualExpense = sourceStatus.value === 'pendiente' ? props.expenseToReconcile : selectedMatch.value;
-        const importedExpense = sourceStatus.value !== 'pendiente' ? props.expenseToReconcile : selectedMatch.value;
-
-        const manualExpenseRef = doc(db, "expenses", manualExpense.id);
-        const importedExpenseRef = doc(db, "expenses", importedExpense.id);
-
-        batch.update(manualExpenseRef, {
-            status: "Conciliado",
-            bankReference: importedExpense.bankReference,
-            numeroTarjeta: importedExpense.numeroTarjeta,
-            reconciledWith: importedExpenseRef,
-            reconciliationDate: serverTimestamp(),
-            reconciliationDifference: differenceAmount.value,
-            reconciliationComment: differenceComment.value.trim() || null
-        });
-        batch.delete(importedExpenseRef);
-        
-        await batch.commit();
-        emit('reconciliation-success', `Gasto de ${formatCurrency(manualExpense.amount)} conciliado con éxito.`);
-        isOpen.value = false;
-    } catch (error) {
-        console.error("Error al conciliar:", error);
-        alert("Hubo un error al procesar la conciliación.");
-    } finally {
-        isLoading.value = false;
-    }
-};
-
-const handleManualConciliation = async () => {
-     isLoading.value = true;
-     try {
-        const expenseRef = doc(db, "expenses", props.expenseToReconcile.id);
-        await updateDoc(expenseRef, {
-            status: "conciliado-manual",
-            reconciliationDate: serverTimestamp()
-        });
-        emit('reconciliation-success', `Gasto marcado como 'Conciliado Manualmente'.`);
-        isOpen.value = false;
-     } catch(error) {
-        console.error("Error en conciliación manual:", error);
-        alert("Hubo un error al marcar el gasto.");
-     } finally {
-        isLoading.value = false;
-     }
-};
-
-const formatCurrency = (value) => new Intl.NumberFormat('es-HN', { style: 'currency', currency: 'HNL' }).format(value || 0);
-const formatDate = (timestamp) => {
-    if (!timestamp) return 'N/A';
-    return timestamp.toDate().toLocaleDateString('es-HN');
-};
+  try {
+    // “depósito” mínimo para reusar manualSettleDeposit
+    const depLite = { id: dep.id, amount: dep.amount, matchedTotal: (dep.amount - dep.remainingAmount) };
+    await manualSettleDeposit(depLite, [{ id: props.sale.id }], {
+      finalStatus: ES.LIQUIDADO,
+      comment: `Conciliado desde ventas (orden #${props.sale.orderId || props.sale.id})`
+    });
+    emit('settled', 'Conciliación aplicada desde venta.');
+    open.value = false;
+  } catch (e) {
+    console.error(e);
+    alert('No se pudo conciliar.');
+  }
+}
 </script>
 
-
 <template>
-  <Teleport to="body">
-    <Transition name="modal">
-      <div v-if="isOpen" @click.self="isOpen = false" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-lg shadow-xl w-full max-w-2xl p-6">
-          <h3 class="text-xl font-bold text-gray-900 mb-4">Asistente de Conciliación</h3>
-          
-          <div v-if="expenseToReconcile" class="p-4 bg-blue-50 rounded-lg border border-blue-200 mb-4">
-            <h4 class="font-semibold text-gray-800">Conciliando este gasto {{ sourceStatus === 'pendiente' ? 'registrado manualmente' : 'del banco' }}:</h4>
-            <div class="mt-2 text-sm grid grid-cols-3 gap-2">
-              <span><span class="font-medium">Fecha:</span> {{ formatDate(expenseToReconcile.expenseDate) }}</span>
-              <span><span class="font-medium">Descripción:</span> {{ expenseToReconcile.vendorName }}</span>
-              <span class="font-bold text-lg">{{ formatCurrency(expenseToReconcile.amount) }}</span>
-            </div>
-          </div>
+  <div v-if="open" class="fixed inset-0 bg-black/30 z-50 flex items-center justify-center">
+    <div class="bg-white w-full max-w-3xl rounded-xl shadow-xl p-6">
+      <div class="flex justify-between items-center mb-3">
+        <h3 class="text-lg font-semibold">
+          Venta #{{ sale?.orderId || sale?.id }} · L {{ Number(sale?.grossPayments || 0).toFixed(2) }}
+        </h3>
+        <button class="text-gray-500 hover:text-gray-800" @click="open=false">✕</button>
+      </div>
 
-          <div v-if="!selectedMatch">
-            <h4 class="font-semibold text-gray-800 mb-2">Paso 1: Selecciona la transacción {{ sourceStatus === 'pendiente' ? 'del banco' : 'manual' }} correspondiente</h4>
-            <div class="max-h-64 overflow-y-auto border rounded-lg">
-              <div v-if="isLoading" class="text-center p-8">Buscando coincidencias...</div>
-              <div v-else-if="potentialMatches.length === 0" class="text-center p-8 text-gray-500">No se encontraron coincidencias.</div>
-              <table v-else class="min-w-full">
-                <tbody class="divide-y">
-                  <tr v-for="match in potentialMatches" :key="match.id">
-                    <td class="px-4 py-2 text-sm">{{ formatDate(match.expenseDate) }}</td>
-                    <td class="px-4 py-2 text-sm"><span class="font-medium">{{ match.vendorName }}</span><br><span class="text-gray-500">{{ match.description }}</span></td>
-                    <td class="px-4 py-2 text-sm font-medium">{{ formatCurrency(match.amount) }}</td>
-                    <td class="px-4 py-2 text-right"><button @click="selectForConfirmation(match)" class="px-3 py-1 bg-indigo-600 text-white text-sm font-semibold rounded hover:bg-indigo-700">Seleccionar</button></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div v-if="selectedMatch" class="mt-4 pt-4 border-t">
-              <h4 class="font-semibold text-gray-800 mb-2">Paso 2: Confirma y justifica la diferencia (si la hay)</h4>
-              <div class="p-3 bg-gray-100 rounded-md">
-                 <div v-if="differenceAmount !== 0">
-                    <p class="font-medium">Se ha detectado una diferencia:</p>
-                    <p class="text-2xl font-bold" :class="differenceAmount > 0 ? 'text-red-600' : 'text-green-600'">
-                       {{ formatCurrency(differenceAmount) }}
-                       <span class="text-sm font-medium">{{ differenceAmount > 0 ? '(Faltante en registro manual)' : '(Sobrante en registro manual)' }}</span>
-                    </p>
-                    <p class="text-xs text-gray-500">(Monto del banco: {{ formatCurrency(sourceStatus !== 'pendiente' ? expenseToReconcile.amount : selectedMatch.amount) }}, Monto manual: {{ formatCurrency(sourceStatus === 'pendiente' ? expenseToReconcile.amount : selectedMatch.amount) }})</p>
-                    <div class="mt-2">
-                        <label class="block text-sm font-medium text-gray-700">Justificación de la diferencia (Obligatorio)</label>
-                        <textarea v-model="differenceComment" rows="2" class="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md shadow-sm" placeholder="Ej: Cobro de ISV no registrado"></textarea>
-                    </div>
-                 </div>
-                 <div v-else>
-                    <p class="text-green-700 font-medium">Los montos coinciden perfectamente. Puedes confirmar la conciliación.</p>
-                 </div>
-              </div>
-          </div>
-
-          <div class="mt-6 flex justify-between items-center">
-             <button v-if="!selectedMatch && sourceStatus !== 'pendiente'" @click="handleManualConciliation" class="text-sm text-indigo-600 hover:underline">
-                Marcar como Conciliado (sin Gasto Manual)
-             </button>
-             <div v-else></div>
-             <div>
-                <button type="button" @click="isOpen = false" class="px-4 py-2 bg-gray-200 text-gray-800 rounded-md mr-2">Cerrar</button>
-                <button v-if="selectedMatch" @click="confirmReconciliation" :disabled="isLoading" class="px-4 py-2 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700">Confirmar Conciliación</button>
-             </div>
-          </div>
+      <div class="grid grid-cols-3 gap-3 mb-4">
+        <div>
+          <label class="text-sm text-gray-600">Ventana (± días)</label>
+          <input type="number" min="0" v-model.number="dayWindow" class="mt-1 w-full border rounded px-2 py-1" @change="loadCandidates">
+        </div>
+        <div>
+          <label class="text-sm text-gray-600">Tolerancia (L)</label>
+          <input type="number" min="0" v-model.number="tolerance" class="mt-1 w-full border rounded px-2 py-1" @change="loadCandidates">
+        </div>
+        <div>
+          <label class="text-sm text-gray-600">Restante venta</label>
+          <div class="mt-2 font-semibold">L {{ saleRemaining.toFixed(2) }}</div>
         </div>
       </div>
-    </Transition>
-  </Teleport>
+
+      <div class="border rounded p-3 h-72 overflow-auto">
+        <div v-if="loading" class="text-sm text-gray-600">Buscando depósitos cercanos…</div>
+        <div v-else-if="candidates.length === 0" class="text-sm text-gray-600">Sin candidatos.</div>
+
+        <table v-else class="w-full text-sm">
+          <thead class="text-gray-500">
+            <tr>
+              <th class="text-left py-1">Sel</th>
+              <th class="text-left py-1">Fecha</th>
+              <th class="text-left py-1">Vendedor</th>
+              <th class="text-left py-1">Tienda</th>
+              <th class="text-right py-1">Restante Dep.</th>
+              <th class="text-left py-1">Estado</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="d in candidates" :key="d.id" class="border-t">
+              <td class="py-1">
+                <input
+                  type="radio"
+                  name="dep_pick"
+                  :value="d.id"
+                  v-model="selectedId"
+                />
+              </td>
+              <td class="py-1">{{ d.transactionDate?.toLocaleDateString('es-HN') }}</td>
+              <td class="py-1">{{ d.vendorName || '—' }}</td>
+              <td class="py-1">{{ d.storeName || '—' }}</td>
+              <td class="py-1 text-right">L {{ Number(d.remainingAmount).toFixed(2) }}</td>
+              <td class="py-1 capitalize">{{ d.status }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4 flex justify-end gap-2">
+        <button class="px-4 py-2 bg-gray-200 rounded" @click="open=false">Cancelar</button>
+        <button class="px-4 py-2 bg-green-600 text-white rounded" @click="confirm">Conciliar</button>
+      </div>
+    </div>
+  </div>
 </template>

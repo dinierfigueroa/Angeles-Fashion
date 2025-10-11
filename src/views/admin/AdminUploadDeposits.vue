@@ -2,7 +2,7 @@
 import { ref, computed } from 'vue';
 import { db } from '@/firebase';
 import {
-  collection, writeBatch, doc, serverTimestamp, query, where, getDocs, Timestamp
+  collection, writeBatch, doc, serverTimestamp, query, where, getDocs, getDoc, Timestamp
 } from 'firebase/firestore';
 import * as XLSX from 'xlsx';
 import AlertModal from '@/components/modals/AlertModal.vue';
@@ -10,6 +10,7 @@ import { useAuthStore } from '@/stores/authStore';
 import { linkDepositToSales } from '@/services/reconcileService';
 
 const authStore = useAuthStore();
+
 const selectedFile = ref(null);
 const fileName = ref('Ningún archivo seleccionado');
 const selectedBank = ref('');
@@ -19,22 +20,43 @@ const isProcessing = ref(false);
 const isAlertOpen = ref(false);
 const alertMessage = ref('');
 
+/* ---------------- Normalización de banco -> bankKey ---------------- */
+const normalizeBankKey = (raw = '') => {
+  const s = raw
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\./g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+  if (s.includes('CREDOMATIC') || s === 'BAC') return 'BAC';
+  if (s.includes('FICO')) return 'FICOHSA';
+  if (s.includes('ATLANT')) return 'ATLANTIDA';
+  if (s.includes('PAIS')) return 'BANPAIS';
+  if (s.includes('OCCIDENT')) return 'OCCIDENTE';
+  return s || 'DESCONOCIDO';
+};
+
 const dbFields = ref([
-  { key: 'transactionDate', label: 'Fecha de Transacción', required: true, mappedColumn: '' },
-  { key: 'description', label: 'Descripción', required: true, mappedColumn: '' },
-  { key: 'referenceT', label: 'Referencia', required: false, mappedColumn: '' },
-  { key: 'amount', label: 'Monto (Crédito)', required: true, mappedColumn: '' },
+  { key: 'transactionDate', label: 'Fecha de Transacción', required: true,  mappedColumn: '' },
+  { key: 'description',     label: 'Descripción',          required: true,  mappedColumn: '' },
+  { key: 'referenceT',      label: 'Referencia',           required: false, mappedColumn: '' },
+  { key: 'amount',          label: 'Monto (Crédito)',      required: true,  mappedColumn: '' },
 ]);
 
 const showMappingUI = computed(() => excelHeaders.value.length > 0 && selectedBank.value);
-const previewData = computed(() => excelData.value.length < 2 ? [] : excelData.value.slice(1, 6));
+const previewData  = computed(() => excelData.value.length < 2 ? [] : excelData.value.slice(1, 6));
 
+/* ---------------- Parseo de fechas desde Excel ---------------- */
 const parseDate = (dateInput) => {
   if (!dateInput) return null;
+
+  // Excel serial number
   if (typeof dateInput === 'number' && dateInput > 1) {
     const date = new Date(Math.round((dateInput - 25569) * 86400 * 1000));
     return new Date(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
   }
+
+  // dd/mm/yyyy
   if (typeof dateInput === 'string') {
     const parts = dateInput.split('/');
     if (parts.length === 3) {
@@ -47,15 +69,19 @@ const parseDate = (dateInput) => {
       }
     }
   }
+
   const finalAttempt = new Date(dateInput);
   return !isNaN(finalAttempt.getTime()) ? finalAttempt : null;
 };
 
+/* ---------------- Carga de archivo ---------------- */
 const handleFileChange = (event) => {
   const file = event.target.files[0];
   if (!file) return;
+
   selectedFile.value = file;
   fileName.value = file.name;
+
   const reader = new FileReader();
   reader.onload = (e) => {
     try {
@@ -63,6 +89,7 @@ const handleFileChange = (event) => {
       const workbook = XLSX.read(data, { type: 'array' });
       const ws = workbook.Sheets[workbook.SheetNames[0]];
       const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true });
+
       if (jsonData.length > 1) {
         excelHeaders.value = jsonData[0].map(String);
         excelData.value = jsonData;
@@ -71,7 +98,7 @@ const handleFileChange = (event) => {
         resetFileState();
       }
     } catch (error) {
-      console.error("Error al procesar el archivo Excel:", error);
+      console.error('Error al procesar el archivo Excel:', error);
       showAlert('Hubo un error al leer el archivo. Asegúrate de que sea un formato válido.');
       resetFileState();
     }
@@ -79,21 +106,24 @@ const handleFileChange = (event) => {
   reader.readAsArrayBuffer(file);
 };
 
+/* ---------------- Subida y conciliación ---------------- */
 const handleUpload = async () => {
   isProcessing.value = true;
 
+  // Validación de mapeo
   if (dbFields.value.some(f => f.required && !f.mappedColumn)) {
     showAlert('Por favor, mapea todas las columnas requeridas (*).');
     isProcessing.value = false;
     return;
   }
 
-  const mapping = dbFields.value.reduce((acc, field) => ({ ...acc, [field.key]: field.mappedColumn }), {});
+  const mapping = dbFields.value.reduce((acc, f) => ({ ...acc, [f.key]: f.mappedColumn }), {});
   const dataRows = excelData.value.slice(1);
 
+  // Parseo
   const parsedRows = dataRows.map(row => {
     const amountStr = String(row[excelHeaders.value.indexOf(mapping.amount)] || '0');
-    const amount = parseFloat(amountStr.replace(/[^0-9.-]+/g, ""));
+    const amount = parseFloat(amountStr.replace(/[^0-9.-]+/g, ''));
     const date = parseDate(row[excelHeaders.value.indexOf(mapping.transactionDate)]);
     const reference = mapping.referenceT ? String(row[excelHeaders.value.indexOf(mapping.referenceT)] || '') : '';
     if (isNaN(amount) || amount <= 0 || !date) return null;
@@ -112,27 +142,30 @@ const handleUpload = async () => {
     return;
   }
 
+  // Rango de fechas para evitar duplicados por ventana
   const dates = parsedRows.map(r => r.date);
   const minDate = new Date(Math.min.apply(null, dates));
   const maxDate = new Date(Math.max.apply(null, dates));
 
   try {
+    // Duplicados existentes en ventana
     const q = query(
-      collection(db, "deposits"),
-      where("bank", "==", selectedBank.value),
-      where("transactionDate", ">=", Timestamp.fromDate(minDate)),
-      where("transactionDate", "<=", Timestamp.fromDate(maxDate))
+      collection(db, 'deposits'),
+      where('bank', '==', selectedBank.value),
+      where('transactionDate', '>=', Timestamp.fromDate(minDate)),
+      where('transactionDate', '<=', Timestamp.fromDate(maxDate))
     );
     const existingDepositsSnapshot = await getDocs(q);
 
     const existingKeys = new Set();
-    existingDepositsSnapshot.forEach(docu => {
-      const data = docu.data();
+    existingDepositsSnapshot.forEach(d => {
+      const data = d.data();
       const dateStr = data.transactionDate.toDate().toISOString().split('T')[0];
       const key = `${data.bank}-${dateStr}-${data.amount}-${data.referenceT || ''}`;
       existingKeys.add(key);
     });
 
+    // Escritura batch
     const batch = writeBatch(db);
     let newCount = 0;
     let skippedCount = 0;
@@ -142,41 +175,47 @@ const handleUpload = async () => {
       const newKey = `${selectedBank.value}-${row.dateStr}-${row.amount}-${row.reference}`;
       if (existingKeys.has(newKey)) {
         skippedCount++;
-      } else {
-        const newDepositRef = doc(collection(db, "deposits"));
-        batch.set(newDepositRef, {
-          bank: selectedBank.value,
-          transactionDate: row.date,
-          description: row.description,
-          referenceT: row.reference,
-          amount: row.amount,
-          status: 'disponible',
-          uploadDate: serverTimestamp(),
-          createdBy_uid: doc(db, 'users', authStore.user.uid),
-          matchedTotal: 0,
-          remainingAmount: row.amount,
-          settledBy: null,
-          saleRef: []
-        });
-        existingKeys.add(newKey);
-        newCount++;
-        createdIds.push(newDepositRef.id);
+        continue;
       }
+
+      const newDepositRef = doc(collection(db, 'deposits'));
+      batch.set(newDepositRef, {
+        bank: selectedBank.value,
+        bankKey: normalizeBankKey(selectedBank.value), // clave normalizada
+        transactionDate: row.date,
+        description: row.description,
+        referenceT: row.reference,
+        amount: row.amount,
+        status: 'disponible',             // <- ESTADO INICIAL EN ESPAÑOL
+        uploadDate: serverTimestamp(),
+        createdBy_uid: doc(db, 'users', authStore.user.uid),
+        matchedTotal: 0,
+        remainingAmount: row.amount,
+        settledBy: null,
+        saleRef: []
+      });
+
+      existingKeys.add(newKey);
+      newCount++;
+      createdIds.push(newDepositRef.id);
     }
 
+    // Commit
     if (newCount > 0) {
       await batch.commit();
-      // Conciliación automática por cada depósito creado
+
+      // Intento de conciliación inmediata en cliente (además de los triggers)
       for (const id of createdIds) {
-        // leemos el doc recién creado
-        const snap = await getDocs(query(collection(db,'deposits'), where('__name__','==', id), limit(1)));
-        if (!snap.empty) {
-          const dep = { id, ...snap.docs[0].data() };
+        const dd = await getDoc(doc(db, 'deposits', id));
+        if (dd.exists()) {
+          const dep = { id, ...dd.data() };
+          // tolerancia 0 Lempiras, ventana de ±1 día (ajustable)
           await linkDepositToSales(dep, { tolerance: 0, dayWindow: 1 });
         }
       }
     }
 
+    // Mensaje
     let message = `Proceso completado.\n- Se subieron ${newCount} depósitos nuevos.`;
     if (skippedCount > 0) {
       message += `\n- Se omitieron ${skippedCount} depósitos duplicados.`;
@@ -184,13 +223,14 @@ const handleUpload = async () => {
     showAlert(message);
     resetFileState();
   } catch (error) {
-    console.error("Error al subir depósitos:", error);
+    console.error('Error al subir depósitos:', error);
     showAlert(`Ocurrió un error: ${error.message}. Es muy probable que necesites crear un índice en Firestore. Revisa la consola (F12) para ver el enlace.`);
   } finally {
     isProcessing.value = false;
   }
 };
 
+/* ---------------- Helpers UI ---------------- */
 const resetFileState = () => {
   selectedFile.value = null;
   fileName.value = 'Ningún archivo seleccionado';
@@ -245,7 +285,7 @@ const showAlert = (msg) => {
           <label :for="`map-${field.key}`" class="font-medium text-gray-700">
             {{ field.label }}<span v-if="field.required" class="text-red-500">*</span>
           </label>
-          <select :id="`map-${field.key}`" v-model="field.mappedColumn" class="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm">
+          <select :id="`map-${field.key}`" v-model="field.mappedColumn" class="w-full px-3 py-2 border border-gray-300 rounded-md">
             <option value="">-- No usar --</option>
             <option v-for="header in excelHeaders" :key="header" :value="header">{{ header }}</option>
           </select>
