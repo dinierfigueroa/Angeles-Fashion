@@ -1,54 +1,37 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue';
-import { db } from '@/firebase';
+import { db, storage } from '@/firebase';
 import {
-  addDoc, updateDoc, doc, collection, serverTimestamp, Timestamp,
+  addDoc, updateDoc, doc, collection, serverTimestamp, Timestamp, getDoc
 } from 'firebase/firestore';
+import { ref as sRef, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { useAuthStore } from '@/stores/authStore';
-
-// 💡 Si ya creaste servicios aparte, puedes reemplazar estas llamadas
-// por funciones de dailyReportsService. Este archivo funciona por sí solo.
 
 const auth = useAuthStore();
 
-/* ---------------------------
-   Modelo del formulario
---------------------------- */
+/* ---------- utils ---------- */
 const todayStr = () => {
   const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 };
+const toTs = (s) => Timestamp.fromDate(new Date(`${s}T00:00:00`));
 
+/* ---------- form ---------- */
 const form = ref({
-  // fecha en texto para el <input type="date">
   reportDateStr: todayStr(),
-
-  // referencias
-  storeRef: null,       // DocumentReference de la tienda
+  storeRef: null,        // DocReference (stores)
   storeName: '',
   cashierName: '',
-
-  // flags
-  hasValues: true,      // ¿Hay valores que reportar?
-  status: 'draft',      // draft | pending_images | submitted | approved | rejected
-
-  // montos
+  hasValues: null,       // radios sin selección inicial
+  status: 'draft',
   salesNet: 0,
   cashCaptured: 0,
   posCaptured: 0,
   depositsCaptured: 0,
-
-  // archivos (URLs opcionales si ya subiste a Storage; aquí solo guardamos texto)
-  depositImages: [],    // ["https://..."]
-  posReportImages: [],  // ["https://..."]
-
-  // comentario final obligatorio al enviar
+  // URLs definitivos (después de subir)
+  depositImages: [],
+  posReportImages: [],
   comment: '',
-
-  // auditoría
   createdBy: null,
   createdByName: '',
 });
@@ -56,67 +39,127 @@ const form = ref({
 const isSaving = ref(false);
 const lastSavedId = ref(null);
 
-/* ---------------------------
-   Permisos / rol
---------------------------- */
-const roleId = computed(() => (auth.user?.roleId?.id || '').toLowerCase());
-const isAdmin = computed(() => roleId.value.includes('admin'));
-const isSuper = computed(() => roleId.value.includes('super'));
-const isManager = computed(() => roleId.value.includes('gerente'));
-const isOperator = computed(() => roleId.value.includes('operador'));
-const canPickStore = computed(() => isAdmin.value || isSuper.value);
+/* ---------- buffers de archivos (aún sin subir) ---------- */
+const pending = ref({
+  depositFiles: /** @type {File[]} */ ([]),
+  posFiles: /** @type {File[]} */ ([]),
+});
+const previews = ref({
+  deposit: /** @type {string[]} */ ([]),
+  pos: /** @type {string[]} */ ([]),
+});
+const upProg = ref({ deposit: 0, pos: 0 });
 
-// Si no es admin/super, fijamos la tienda del usuario
-onMounted(() => {
-  if (!canPickStore.value) {
-    if (auth.user?.storeId) {
-      form.value.storeRef = auth.user.storeId;          // DocumentReference
-      form.value.storeName = auth.user.storeName || ''; // por si lo tienes en el perfil
+/* ---------- permisos ---------- */
+const roleId = computed(() => (auth.user?.roleId?.id || '').toLowerCase());
+const isManager = computed(() => roleId.value.includes('gerente'));
+const isAdminOrSuper = computed(() => roleId.value.includes('admin') || roleId.value.includes('super'));
+const canPickStore = computed(() => isAdminOrSuper.value); // gerente usa su tienda fija
+
+/* ---------- cargar usuario/tienda ---------- */
+async function loadUserAndStore() {
+  const uid = auth.user?.uid;
+  if (!uid) return;
+
+  const userSnap = await getDoc(doc(db, 'users', uid));
+  if (userSnap.exists()) {
+    const u = userSnap.data();
+    form.value.cashierName = u.display_name || auth.user?.displayName || auth.user?.name || '';
+    form.value.createdBy = uid;
+    form.value.createdByName = form.value.cashierName;
+
+    if (u.storeId) {
+      form.value.storeRef = u.storeId; // DocReference
+      try {
+        const storeSnap = await getDoc(u.storeId);
+        if (storeSnap.exists()) {
+          const s = storeSnap.data();
+          form.value.storeName = s.name || s.storeName || s.title || '';
+        }
+      } catch (e) {
+        console.warn('No se pudo leer la tienda:', e);
+      }
     }
+  } else {
+    // fallback si no existe /users/{uid}
     form.value.cashierName = auth.user?.displayName || auth.user?.name || '';
+    form.value.createdBy = uid;
+    form.value.createdByName = form.value.cashierName;
   }
-  form.value.createdBy = auth.user?.uid || null;
-  form.value.createdByName = auth.user?.displayName || auth.user?.name || '';
+}
+onMounted(loadUserAndStore);
+
+/* ---------- UI derivadas ---------- */
+const showValues = computed(() => form.value.hasValues === true);
+const showOnlySend = computed(() => form.value.hasValues === false);
+const diff = computed(() => {
+  const v = Number(form.value.salesNet||0);
+  const r = Number(form.value.cashCaptured||0) + Number(form.value.posCaptured||0) + Number(form.value.depositsCaptured||0);
+  return (v - r).toFixed(2);
 });
 
-/* ---------------------------
-   Helpers
---------------------------- */
-function toTimestampFromStr(yyyyMmDd) {
-  const date = new Date(`${yyyyMmDd}T00:00:00`);
-  return Timestamp.fromDate(date);
+/* ---------- manejo de archivos ---------- */
+function onPick(kind, e) {
+  const files = Array.from(e.target.files || []);
+  pending.value[kind === 'deposit' ? 'depositFiles' : 'posFiles'] = files;
+
+  // Previews locales
+  previews.value[kind] = files.map((f) => URL.createObjectURL(f));
 }
 
-function diffExplained() {
-  // ejemplo simple: diferencia entre ventas netas y (pos + depósitos + efectivo)
-  const expected = Number(form.value.salesNet || 0);
-  const reported = Number(form.value.posCaptured || 0)
-    + Number(form.value.depositsCaptured || 0)
-    + Number(form.value.cashCaptured || 0);
-  return (expected - reported).toFixed(2);
+async function uploadFiles(kind, files) {
+  const urls = [];
+  let done = 0;
+  for (const f of files) {
+    const ext = (f.name || 'jpg').split('.').pop();
+    const path = `dailyReports/${form.value.reportDateStr}/${auth.user?.uid || 'anon'}/${kind}-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const r = sRef(storage, path);
+    const snap = await uploadBytes(r, f);
+    const url = await getDownloadURL(snap.ref);
+    urls.push(url);
+    done++;
+    upProg.value[kind] = Math.round((done / files.length) * 100);
+  }
+  setTimeout(() => (upProg.value[kind] = 0), 500);
+  return urls;
 }
 
-/* ---------------------------
-   Acciones
---------------------------- */
-// Guardar como **Borrador** (o “Pendiente imágenes” si marcó que sí hay valores)
+/* ---------- helpers de persistencia ---------- */
+async function ensureUploadsIfNeeded() {
+  // Sube lo que esté pendiente.
+  if (pending.value.depositFiles.length) {
+    const urls = await uploadFiles('deposit', pending.value.depositFiles);
+    form.value.depositImages = urls;
+    pending.value.depositFiles = [];
+  }
+  if (pending.value.posFiles.length) {
+    const urls = await uploadFiles('pos', pending.value.posFiles);
+    form.value.posReportImages = urls;
+    pending.value.posFiles = [];
+  }
+}
+
+/* ---------- acciones ---------- */
 async function saveDraft() {
   isSaving.value = true;
   try {
+    // sube archivos si el usuario ya eligió
+    await ensureUploadsIfNeeded();
+
     const payload = {
-      reportDate: toTimestampFromStr(form.value.reportDateStr),
+      reportDate: toTs(form.value.reportDateStr),
       storeRef: form.value.storeRef || null,
       storeName: form.value.storeName || '',
       cashierName: form.value.cashierName || '',
-      hasValues: !!form.value.hasValues,
+      hasValues: form.value.hasValues === true,
       salesNet: Number(form.value.salesNet || 0),
       cashCaptured: Number(form.value.cashCaptured || 0),
       posCaptured: Number(form.value.posCaptured || 0),
       depositsCaptured: Number(form.value.depositsCaptured || 0),
-      depositImages: form.value.depositImages || [],
-      posReportImages: form.value.posReportImages || [],
+      depositImages: form.value.depositImages,
+      posReportImages: form.value.posReportImages,
       comment: form.value.comment || '',
-      status: form.value.hasValues ? 'pending_images' : 'submitted',
+      status: form.value.hasValues === true ? 'pending_images' : 'submitted',
       createdBy: form.value.createdBy,
       createdByName: form.value.createdByName,
       updatedAt: serverTimestamp(),
@@ -124,79 +167,65 @@ async function saveDraft() {
     };
 
     const col = collection(db, 'dailyStoreReports');
-    const docRef = await addDoc(col, payload);
-    lastSavedId.value = docRef.id;
+    const { id } = await addDoc(col, payload);
+    lastSavedId.value = id;
     form.value.status = payload.status;
     alert('Guardado como borrador.');
   } catch (e) {
-    console.error(e);
-    alert('No se pudo guardar.');
+    console.error('saveDraft error:', e);
+    alert(`No se pudo guardar: ${e.message || e}`);
   } finally {
     isSaving.value = false;
   }
 }
 
-// Enviar para **revisión** (valida imágenes y comentario si hay valores)
 async function submitForReview() {
-  if (form.value.hasValues) {
-    if (!form.value.depositImages?.length || !form.value.posReportImages?.length) {
-      alert('Debes adjuntar la imagen del depósito y el reporte del POS antes de enviar.');
-      return;
-    }
-    if (!form.value.comment || !form.value.comment.trim()) {
-      alert('Agrega un comentario antes de enviar.');
-      return;
-    }
-  }
-
-  isSaving.value = true;
   try {
+    // Si hay valores, asegúrate de tener evidencias (y súbelas si solo están pendientes)
+    if (showValues.value) {
+      await ensureUploadsIfNeeded();
+
+      if (!form.value.depositImages.length || !form.value.posReportImages.length) {
+        alert('Debes adjuntar la imagen del depósito y el reporte del POS antes de enviar.');
+        return;
+      }
+      if (!form.value.comment?.trim()) {
+        alert('Agrega un comentario antes de enviar.');
+        return;
+      }
+    }
+
+    isSaving.value = true;
+
+    const base = {
+      reportDate: toTs(form.value.reportDateStr),
+      storeRef: form.value.storeRef || null,
+      storeName: form.value.storeName || '',
+      cashierName: form.value.cashierName || '',
+      hasValues: form.value.hasValues === true,
+      salesNet: Number(form.value.salesNet || 0),
+      cashCaptured: Number(form.value.cashCaptured || 0),
+      posCaptured: Number(form.value.posCaptured || 0),
+      depositsCaptured: Number(form.value.depositsCaptured || 0),
+      depositImages: form.value.depositImages,
+      posReportImages: form.value.posReportImages,
+      comment: form.value.comment || '',
+      status: 'submitted',
+      updatedAt: serverTimestamp(),
+    };
+
     if (!lastSavedId.value) {
-      // nunca se guardó: creamos y dejamos en submitted
       const col = collection(db, 'dailyStoreReports');
-      const docRef = await addDoc(col, {
-        reportDate: toTimestampFromStr(form.value.reportDateStr),
-        storeRef: form.value.storeRef || null,
-        storeName: form.value.storeName || '',
-        cashierName: form.value.cashierName || '',
-        hasValues: !!form.value.hasValues,
-        salesNet: Number(form.value.salesNet || 0),
-        cashCaptured: Number(form.value.cashCaptured || 0),
-        posCaptured: Number(form.value.posCaptured || 0),
-        depositsCaptured: Number(form.value.depositsCaptured || 0),
-        depositImages: form.value.depositImages || [],
-        posReportImages: form.value.posReportImages || [],
-        comment: form.value.comment || '',
-        status: 'submitted',
-        createdBy: form.value.createdBy,
-        createdByName: form.value.createdByName,
-        updatedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      });
-      lastSavedId.value = docRef.id;
+      const { id } = await addDoc(col, { ...base, createdBy: form.value.createdBy, createdByName: form.value.createdByName, createdAt: serverTimestamp() });
+      lastSavedId.value = id;
     } else {
-      await updateDoc(doc(db, 'dailyStoreReports', lastSavedId.value), {
-        reportDate: toTimestampFromStr(form.value.reportDateStr),
-        storeRef: form.value.storeRef || null,
-        storeName: form.value.storeName || '',
-        cashierName: form.value.cashierName || '',
-        hasValues: !!form.value.hasValues,
-        salesNet: Number(form.value.salesNet || 0),
-        cashCaptured: Number(form.value.cashCaptured || 0),
-        posCaptured: Number(form.value.posCaptured || 0),
-        depositsCaptured: Number(form.value.depositsCaptured || 0),
-        depositImages: form.value.depositImages || [],
-        posReportImages: form.value.posReportImages || [],
-        comment: form.value.comment || '',
-        status: 'submitted',
-        updatedAt: serverTimestamp(),
-      });
+      await updateDoc(doc(db, 'dailyStoreReports', lastSavedId.value), base);
     }
     form.value.status = 'submitted';
     alert('Enviado para revisión.');
   } catch (e) {
-    console.error(e);
-    alert('No se pudo enviar.');
+    console.error('submitForReview error:', e);
+    alert(`No se pudo enviar: ${e.message || e}`);
   } finally {
     isSaving.value = false;
   }
@@ -204,109 +233,114 @@ async function submitForReview() {
 </script>
 
 <template>
-  <div class="p-5">
-    <h1 class="text-2xl font-semibold mb-4">Reporte Diario de Operaciones de Caja</h1>
+  <div class="p-5 space-y-4">
+    <h1 class="text-2xl font-semibold">Reporte Diario de Operaciones de Caja</h1>
 
     <!-- Generales -->
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-white p-4 rounded border mb-4">
-      <div>
-        <label class="block text-sm font-medium mb-1">Fecha *</label>
-        <!-- ✅ solo v-model, sin :value ni @input -->
-        <input type="date" class="border rounded p-2 w-full" v-model="form.reportDateStr" />
-      </div>
+    <section class="bg-white rounded-xl border p-4 space-y-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Fecha *</label>
+          <input type="date" class="border rounded-lg p-2 w-full" v-model="form.reportDateStr" />
+        </div>
 
-      <div v-if="canPickStore">
-        <label class="block text-sm font-medium mb-1">Tienda *</label>
-        <!-- Aquí coloca tu selector real de tiendas. Por ahora, free text -->
-        <input class="border rounded p-2 w-full" v-model="form.storeName" placeholder="Nombre de tienda" />
-      </div>
-      <div v-else>
-        <label class="block text-sm font-medium mb-1">Tienda</label>
-        <input class="border rounded p-2 w-full bg-gray-100" :value="form.storeName" readonly />
-      </div>
+        <div v-if="canPickStore">
+          <label class="block text-sm font-medium mb-1">Tienda *</label>
+          <input class="border rounded-lg p-2 w-full" v-model="form.storeName" placeholder="Nombre de tienda" />
+        </div>
+        <div v-else>
+          <label class="block text-sm font-medium mb-1">Tienda</label>
+          <input class="border rounded-lg p-2 w-full bg-gray-100" :value="form.storeName" readonly />
+        </div>
 
-      <div>
-        <label class="block text-sm font-medium mb-1">Cajero / Oficial *</label>
-        <input class="border rounded p-2 w-full" v-model="form.cashierName" placeholder="Nombre del cajero" />
-      </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Cajero / Oficial *</label>
+          <input class="border rounded-lg p-2 w-full" v-model="form.cashierName" placeholder="Nombre del cajero" />
+        </div>
 
-      <div>
-        <label class="block text-sm font-medium mb-1">¿Hay valores que reportar?</label>
-        <div class="flex gap-6 mt-2">
-          <label class="flex items-center gap-2">
-            <input type="radio" value="true" v-model="form.hasValues" :true-value="true" :false-value="false" />
-            Sí
-          </label>
-          <label class="flex items-center gap-2">
-            <input type="radio" value="false" v-model="form.hasValues" :true-value="true" :false-value="false" />
-            No
-          </label>
+        <div>
+          <label class="block text-sm font-medium mb-1">¿Hay valores que reportar?</label>
+          <div class="flex gap-6 mt-2">
+            <label class="flex items-center gap-2">
+              <input type="radio" :value="true" v-model="form.hasValues" />
+              Sí
+            </label>
+            <label class="flex items-center gap-2">
+              <input type="radio" :value="false" v-model="form.hasValues" />
+              No
+            </label>
+          </div>
+          <p v-if="form.hasValues===null" class="text-xs text-gray-500 mt-1">Seleccione una opción para continuar.</p>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- Valores -->
-    <div v-if="form.hasValues" class="bg-white p-4 rounded border mb-4">
-      <h2 class="font-semibold mb-3">Valores a reportar</h2>
+    <!-- Valores (solo si Sí) -->
+    <section v-if="showValues" class="bg-white rounded-xl border p-4 space-y-4">
+      <h2 class="font-semibold">Valores a reportar</h2>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
           <label class="block text-sm font-medium mb-1">Ventas netas (HNL) *</label>
-          <input type="number" min="0" step="0.01" class="border rounded p-2 w-full" v-model.number="form.salesNet" />
+          <input type="number" min="0" step="0.01" class="border rounded-lg p-2 w-full" v-model.number="form.salesNet" />
         </div>
         <div>
           <label class="block text-sm font-medium mb-1">Pagos captados en efectivo (HNL) *</label>
-          <input type="number" min="0" step="0.01" class="border rounded p-2 w-full" v-model.number="form.cashCaptured" />
+          <input type="number" min="0" step="0.01" class="border rounded-lg p-2 w-full" v-model.number="form.cashCaptured" />
         </div>
         <div>
           <label class="block text-sm font-medium mb-1">Pagos captados con tarjeta (POS) (HNL) *</label>
-          <input type="number" min="0" step="0.01" class="border rounded p-2 w-full" v-model.number="form.posCaptured" />
+          <input type="number" min="0" step="0.01" class="border rounded-lg p-2 w-full" v-model.number="form.posCaptured" />
         </div>
         <div>
           <label class="block text-sm font-medium mb-1">Pagos captados con depósitos (HNL) *</label>
-          <input type="number" min="0" step="0.01" class="border rounded p-2 w-full" v-model.number="form.depositsCaptured" />
+          <input type="number" min="0" step="0.01" class="border rounded-lg p-2 w-full" v-model.number="form.depositsCaptured" />
         </div>
       </div>
 
-      <div class="mt-4 text-sm text-gray-600">
-        Diferencia (Ventas - Reportado): <b>HNL {{ diffExplained() }}</b>
-      </div>
+      <p class="text-sm text-gray-600">Diferencia (Ventas - Reportado): <b>HNL {{ diff }}</b></p>
 
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+      <!-- Evidencias -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
           <label class="block text-sm font-medium mb-1">Foto(s) del depósito</label>
-          <!-- En tu implementación real usa file upload a Storage; aquí guardas URLs -->
-          <textarea class="border rounded p-2 w-full" rows="2"
-            v-model="form.depositImages"
-            placeholder='["https://..."]'></textarea>
+          <input type="file" accept="image/*" capture="environment" multiple @change="(e)=>onPick('deposit', e)" class="block w-full text-sm" />
+          <div v-if="upProg.deposit" class="text-xs text-gray-500 mt-1">Subiendo… {{ upProg.deposit }}%</div>
+          <div class="flex flex-wrap gap-2 mt-2">
+            <img v-for="(u,i) in previews.deposit" :key="'dpv-'+i" :src="u" class="h-16 w-16 object-cover rounded border" />
+            <img v-for="(u,i) in form.depositImages" :key="'dpu-'+i" :src="u" class="h-16 w-16 object-cover rounded border" />
+          </div>
         </div>
+
         <div>
           <label class="block text-sm font-medium mb-1">Reporte de POS / Auditoría (foto)</label>
-          <textarea class="border rounded p-2 w-full" rows="2"
-            v-model="form.posReportImages"
-            placeholder='["https://..."]'></textarea>
+          <input type="file" accept="image/*" capture="environment" multiple @change="(e)=>onPick('pos', e)" class="block w-full text-sm" />
+          <div v-if="upProg.pos" class="text-xs text-gray-500 mt-1">Subiendo… {{ upProg.pos }}%</div>
+          <div class="flex flex-wrap gap-2 mt-2">
+            <img v-for="(u,i) in previews.pos" :key="'ppv-'+i" :src="u" class="h-16 w-16 object-cover rounded border" />
+            <img v-for="(u,i) in form.posReportImages" :key="'ppu-'+i" :src="u" class="h-16 w-16 object-cover rounded border" />
+          </div>
         </div>
       </div>
-    </div>
 
-    <!-- Comentario y acciones -->
-    <div class="bg-white p-4 rounded border">
-      <div class="mb-3">
+      <div>
         <label class="block text-sm font-medium mb-1">Comentarios</label>
-        <textarea class="border rounded p-2 w-full" rows="3" v-model="form.comment"
-          placeholder="Ej.: L 1,200 se dejó para reembolso de caja chica, se adjuntará comprobante."></textarea>
+        <textarea class="border rounded-lg p-2 w-full" rows="3" v-model="form.comment"
+          placeholder="Ej.: L 1,200 se dejó para reembolso de caja chica; se adjunta comprobante."></textarea>
+      </div>
+    </section>
+
+    <!-- Acciones -->
+    <section v-if="form.hasValues!==null" class="bg-white rounded-xl border p-4">
+      <div v-if="showValues" class="flex flex-wrap gap-3 items-center">
+        <button class="px-4 py-2 rounded-lg bg-gray-200" :disabled="isSaving" @click="saveDraft">Guardar como borrador</button>
+        <button class="px-4 py-2 rounded-lg bg-blue-600 text-white" :disabled="isSaving" @click="submitForReview">Enviar para revisión</button>
+        <span v-if="form.status" class="text-sm text-gray-600">Estado actual: <b>{{ form.status }}</b></span>
       </div>
 
-      <div class="flex flex-wrap gap-3">
-        <button class="px-4 py-2 rounded bg-gray-200" :disabled="isSaving" @click="saveDraft">
-          Guardar como borrador
-        </button>
-        <button class="px-4 py-2 rounded bg-blue-600 text-white" :disabled="isSaving" @click="submitForReview">
-          Enviar para revisión
-        </button>
-        <span v-if="form.status" class="text-sm text-gray-600 self-center">
-          Estado actual: <b>{{ form.status }}</b>
-        </span>
+      <div v-else-if="showOnlySend" class="flex flex-wrap gap-3 items-center">
+        <button class="px-4 py-2 rounded-lg bg-blue-600 text-white" :disabled="isSaving" @click="submitForReview">Enviar para revisión</button>
+        <span v-if="form.status" class="text-sm text-gray-600">Estado actual: <b>{{ form.status }}</b></span>
       </div>
-    </div>
+    </section>
   </div>
 </template>
